@@ -196,8 +196,11 @@ pairings (18 split), so it's even against a similar bot.
 
 **Still leaking against the maniac:** calling the flop and turn, then folding
 the river with a pair. Most early hands end preflop, so there's little
-postflop data by hand 10. Next idea: seed the postflop bet-frequency priors
-from their preflop raise rate, which we see every hand.
+postflop data by hand 10. **v5:** the postflop bet and raise priors now move
+with their preflop raise rate, which we see every hand (a maniac starts near
+78% bets, a nit near 27%). Against the maniac the costly folds fell from
+-3,372 to -2,657bb over 50 matches, but wins stayed at 31 of 50. The baseline
+is unaffected (it never bets).
 
 ## 5. Opponent modelling
 
