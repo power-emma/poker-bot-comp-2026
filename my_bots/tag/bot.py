@@ -332,6 +332,38 @@ def is_seven_two(hole):
     return hand_class(hole) in ("72s", "72o")
 
 
+def goes_all_in(state, move):
+    """Would this move put our whole stack in?"""
+    if move["action"] == "all_in":
+        return True
+    if move["action"] == "raise":
+        return move["amount"] >= state["your_stack"] + state["your_bet_this_street"]
+    return move["action"] == "call" and state["amount_owed"] >= state["your_stack"]
+
+
+def seven_two_raise(state):
+    """7-2 never goes all-in: instead raise up to the pot, keeping at least
+    half our stack behind. None if no such raise is possible."""
+    most = state["your_bet_this_street"] + state["your_stack"] // 2
+    amount = min(state["current_bet"] + state["pot"] + state["amount_owed"], most)
+    if amount < state["min_raise_to"] or amount <= state["current_bet"]:
+        return None
+    return {"action": "raise", "amount": int(amount)}
+
+
+def seven_two_no_all_in(state, move):
+    """Swap an all-in move with 7-2 for a raise, a call or check, or a fold."""
+    if not goes_all_in(state, move):
+        return move
+    if move["action"] in ("raise", "all_in"):
+        smaller = seven_two_raise(state)
+        if smaller:
+            return smaller
+        if not state["can_check"] and state["amount_owed"] < state["your_stack"]:
+            return {"action": "call"}
+    return check_or_fold(state)
+
+
 def flush_draw_72s(hole, board):
     """Suited 7-2 with four of its suit counting the board, cards still to come."""
     if hand_class(hole) != "72s" or len(board) == 5:
@@ -848,13 +880,17 @@ def postflop(state, sample):
             continue
         if size_allowed(state, extra, eq_called):
             bets.append((raise_to(state, state["current_bet"] + extra), ev, take, cont))
+    if is_seven_two(hole):                       # 7-2 never goes all-in (strategy.md 7.1)
+        bets = [b for b in bets if not goes_all_in(state, b[0])]
+        options = [o for o in options if not goes_all_in(state, o[0])]
 
     best = max(options + bets, key=lambda o: o[1])
 
-    # 7-2 suited with a flush draw: play it like a high flush draw (strategy.md 7.1).
+    # 7-2 suited with a flush draw: play it like a high flush draw (strategy.md 7.1),
+    # raising to build the pot but never all-in.
     if flush_draw_72s(hole, board) and best[0]["action"] in ("check", "call", "fold") and bets:
         if state["street"] == "flop" and state["your_bet_this_street"] > 0:
-            best = next((o for o in options if o[0]["action"] == "call"), best)   # get it in on the flop
+            best = next((o for o in options if o[0]["action"] == "call"), best)   # call their raise
         else:
             best = max(bets, key=lambda o: o[1])                           # semi-bluff
 
@@ -893,6 +929,7 @@ def decide(game_state: dict) -> dict:
             debug.update(info)
 
         if is_seven_two(hole):
+            move = seven_two_no_all_in(game_state, move)
             debug["seven_two"] = cls
         move["debug"] = debug
         return move

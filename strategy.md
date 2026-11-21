@@ -246,6 +246,12 @@ by how many times we were dealt 7-2. Losing hands don't count against the
 score, but they still cost chips in the match, so the two kinds of 7-2 are
 played differently.
 
+**Never all-in with 7-2 (v6).** No shoves, no all-in bets and no calls that
+put the whole stack in. Where the bot would have gone all-in it raises
+instead: up to a pot-size raise, keeping at least half its stack behind. That
+builds the pot for the prize without risking the match on the hand. Facing
+an all-in, 7-2 folds. (This overrides "get all-in on the flop" below.)
+
 **Seven-two suited (slightly favoured).** About 38% equity against a random
 hand, 3 points better than offsuit. Weak, but not a disaster, and the flush
 potential is real.
