@@ -39,6 +39,8 @@ DEFAULTS = {
     "size_sens": 0.30,     # ...plus this per pot-sized bet (bigger bets need more)
     "raise_min": 0.80,     # raise a bet with this strength
     "raise_mult": 3.0,     # raise to this multiple of their bet
+    "small_raise": 0.0,    # facing a bet of <=40% pot: raise this often whatever we hold (size-tell reader)
+    "big_fold_above": 99,  # facing a bet of >= this fraction of pot: fold unless strong (size-tell reader)
     "bluff_raise": 0.0,    # raise a bet with air this often
     "float": 0.0,          # call a flop bet with air this often (then bet turn if checked to)
     "min_raise_only": False,  # every raise is a min-raise
@@ -245,6 +247,10 @@ def decide(state):
         return {"action": "check"}
 
     frac = owed / max(1, pot - owed)
+    if frac <= 0.4 and r() < P["small_raise"]:
+        return raise_to(state, state["current_bet"] * P["raise_mult"])
+    if frac >= P["big_fold_above"] and s < 0.8:
+        return {"action": "fold"}
     if s >= P["raise_min"]:
         return raise_to(state, state["current_bet"] * P["raise_mult"]) if r() < 0.7 or P["trap"] else {"action": "call"}
     if s < 0.3 and r() < P["bluff_raise"]:
