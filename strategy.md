@@ -301,8 +301,28 @@ The prior's loose-caller floor was cut from 15% to 5%. At 15% the bot went
 all-in with top pair against opponents it knew nothing about, because the
 model treats every caller as holding the strongest hands.
 
+**Risk limits.** The first version lost to the baseline with huge all-in
+bluffs, such as 8-high betting 8,493 into an 800 pot, because the prior
+assumed opponents fold almost everything to a big overbet. Where the model
+knows least, a mistake costs the stack, so two limits sit on top of it:
+
+- **Bluffs** (bets that lose on average when called): at most the pot.
+- **Other bets:** at most 1.5 pot, or the geometric size if that's bigger.
+  Overbets are allowed only once the opponent has called at least 70% of
+  large bets, over at least 5.
+
 `my_bots/tag_v1` is the same bot with the old fixed-size postflop play, kept
-for comparison.
+for comparison. Results, 12 seeds in both seat orders, in the sandbox:
+
+| Opponent | `tag` (value betting) | `tag_v1` |
+|---|---|---|
+| Calling station | 24/24 | 24/24 |
+| Template | 24/24 | 24/24 |
+| Baseline | 20/24 | 23/24 |
+| Maniac | 20/24 | 16/24 |
+
+Head to head, `tag` beat `tag_v1` in 28 of 40 matches. No errors, and the
+slowest match averaged 94ms per decision.
 
 **Next, split across the two computers.**
 

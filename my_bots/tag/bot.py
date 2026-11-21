@@ -86,6 +86,10 @@ STACK_OFF_EQUITY = 0.55          # if they raise our bet, call with this much eq
 RAISE_MULTIPLE = 3               # ...assuming they raise to about this many times our bet
 SIZE_PRIOR_WEIGHT = 6            # a size bucket's prior counts as this many observed bets
 STREETS_LEFT = {"flop": 3, "turn": 2, "river": 1}
+BLUFF_MAX_FRACTION = 1.0         # bets that lose when called: at most the pot
+BET_MAX_FRACTION = 1.5           # other bets: at most this (or the geometric size) ...
+STATION_MIN_BETS = 5             # ... unless they've called at least this many large bets
+STATION_CALL_RATE = 0.7          #     at this rate or more
 
 # Opponent hands that haven't made a pair but have a draw rank like a middling
 # pair when we estimate their range.
@@ -401,7 +405,7 @@ def raise_share():
 
 
 def bet_ev(state, sample, extra):
-    """(EV, expected take, call chance) of calling and raising by `extra` more.
+    """(EV, expected take, call chance, equity when called) of calling and raising by `extra` more.
 
     EV counts the chips we get back minus the chips we put in from now on, so
     folding is 0. Expected take is the part won when they call: the chips we
@@ -426,13 +430,38 @@ def bet_ev(state, sample, extra):
             ev += raised * (eq_raised * (behind + 2 * total) - owed - total)
         else:                                        # they raise, we fold
             ev -= raised * (owed + extra)
-    return ev, take, cont
+    return ev, take, cont, eq_called
+
+
+def confirmed_station():
+    """Seen calling large bets often enough that overbetting them for value is safe."""
+    faced, continued = STATS["faced_by_size"][2], STATS["continued_by_size"][2]
+    return faced >= STATION_MIN_BETS and continued / faced >= STATION_CALL_RATE
+
+
+def size_allowed(state, extra, eq_called):
+    """Risk limits on top of the EV model, where its call estimates are least
+    reliable and a mistake costs the stack: bluffs (bets that lose when
+    called) at most the pot, and overbets only against a confirmed station."""
+    behind = state["pot"] + min(state["amount_owed"], state["your_stack"])
+    fraction = extra / behind
+    if eq_called < 0.5 and fraction > BLUFF_MAX_FRACTION:
+        return False
+    cap = max(BET_MAX_FRACTION, geometric_fraction(state))
+    return fraction <= cap + 1e-9 or confirmed_station()
 
 
 def max_raise(state):
     """The most we can usefully raise by, beyond calling: the smaller remaining stack."""
     owed = min(state["amount_owed"], state["your_stack"])
     return max(0, min(state["your_stack"] - owed, opponent(state)["stack"]))
+
+
+def geometric_fraction(state):
+    """The pot fraction that, bet on every street left, gets the stacks in by the river."""
+    behind = state["pot"] + min(state["amount_owed"], state["your_stack"])
+    streets = STREETS_LEFT[state["street"]]
+    return ((1 + 2 * max_raise(state) / behind) ** (1 / streets) - 1) / 2
 
 
 def bet_sizes(state):
@@ -442,11 +471,9 @@ def bet_sizes(state):
     if room <= 0:
         return []
     behind = state["pot"] + min(state["amount_owed"], state["your_stack"])
-    streets = STREETS_LEFT[state["street"]]
-    geometric = ((1 + 2 * room / behind) ** (1 / streets) - 1) / 2
     smallest = state["min_raise_to"] - state["current_bet"]
     sizes = {room}
-    for fraction in BET_FRACTIONS + (geometric,):
+    for fraction in BET_FRACTIONS + (geometric_fraction(state),):
         sizes.add(min(room, max(smallest, int(fraction * behind))))
     return sorted(s for s in sizes if s > 0)
 
@@ -551,8 +578,9 @@ def postflop(state, sample):
                    ({"action": "call"}, eq * (live_pot + call) - call, 0.0, None)]
     bets = []
     for extra in bet_sizes(state):
-        ev, take, cont = bet_ev(state, sample, extra)
-        bets.append((raise_to(state, state["current_bet"] + extra), ev, take, cont))
+        ev, take, cont, eq_called = bet_ev(state, sample, extra)
+        if size_allowed(state, extra, eq_called):
+            bets.append((raise_to(state, state["current_bet"] + extra), ev, take, cont))
 
     best = max(options + bets, key=lambda o: o[1])
 
