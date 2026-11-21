@@ -63,7 +63,7 @@ The bot plays differently depending on stack depth: the smaller stack, measured 
 3. **Bluffs:** after a bet, a share of bluffs is added from their weaker hands. It starts at the standard
    bluff ratio for that bet size and is adjusted by how often this opponent's bets turned out to be
    bluffs at showdown.
-4. **Simulation:** about 3,000 showdowns against hands drawn from that range. Each result is tagged with
+4. **Simulation:** 12,000 showdowns against hands drawn from that range. Each result is tagged with
    where the opponent's hand sits in the range, from strongest to weakest. That lets it ask, for
    example, "what's my equity against just the top 40% that would call this bet?"
 
@@ -105,13 +105,15 @@ It takes the option with the highest EV, after these limits:
   against a balanced bot like Slumbot it folds too often on the turn and river.
 - **Stats need time:** early on it relies on its default assumptions until it has seen enough hands.
 - **Fixed simulation counts:** they're a set number, not a time budget, so a seeded match replays
-  exactly. Decisions take about 25–60 ms, well inside the 2-second limit.
+  exactly. At half a CPU, decisions average about 60 ms (about 180 ms after the flop), and the
+  slowest seen was 262 ms, well inside the 2-second limit.
 
 ## Results (v10)
 
 | Test | Result |
 |---|---|
 | Sparring A/B, 10 bots × 10 duplicate pairs | 0.755 (51 W / 49 D / 0 L), vs 0.720 for the same bot without the v10 overbet and out-of-position changes |
-| Slumbot, 2,000 hands (200bb, flat 50/100) | −31 bb/100 (±81 at 95%) |
+| Slumbot, 2,000 hands (200bb, flat 50/100) | +0.3 bb/100 (±70 at 95%) with 12,000 simulations; −31 (±81) with 3,000 |
+| Sparring A/B, 16 bots × 15 pairs, 12,000 vs 3,000 simulations | 0.796 vs 0.792 |
 | Live against Sonnet, 50 hands (seed 4242) | +3,190 |
 | Live against Opus, 50 hands (seed 4242) | +17,806 (mostly two stacks Opus put in badly) |

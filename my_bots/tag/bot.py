@@ -153,8 +153,8 @@ DEEP_JAM_PRIOR_WEIGHT = 3        # ...counting as this many decisions (light: an
 # Discount checkdown equity for the betting left after a short-stack flat call.
 SHORT_CALL_REALIZATION_IP = 0.90
 SHORT_CALL_REALIZATION_OOP = 0.80
-PREFLOP_RANGE_SIMS = 1000
-POSTFLOP_SIMS = 3000             # more than preflop: narrow calling ranges use a slice of them
+PREFLOP_RANGE_SIMS = 4000
+POSTFLOP_SIMS = 12000            # more than preflop: narrow calling ranges use a slice of them
 RERAISE_EQUITY = 0.60            # re-raise preflop with this much equity against their raising range
 OUT_OF_POSITION_MARGIN = 0.0     # extra equity a preflop call needs (tuned: 0.08 folded too much, v8)
 BUTTON_OPEN_TOP = 0.50           # open (raise first in) from the button with the top X% of hands
