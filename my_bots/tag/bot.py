@@ -69,9 +69,9 @@ STATS = {
     "hands": 0, "preflop_raised": 0,               # hands seen, hands they raised preflop
     "bet_chances": 0, "bets": 0,                   # postflop, nothing to call: did they bet?
     "faced_bets": 0, "calls": 0, "raises": 0,      # postflop, facing a bet: call / raise?
-    "faced_by_size": [0, 0, 0, 0],                 # ... the same, split by the bet's size
-    "continued_by_size": [0, 0, 0, 0],             #     (see SIZE_BUCKETS): didn't fold
-}
+    "faced_by_size": [[0, 0, 0, 0], [0, 0, 0, 0]], # ... the same, split by [already continued
+    "continued_by_size": [[0, 0, 0, 0], [0, 0, 0, 0]],  # against a bet this hand][size bucket,
+}                                                  # see SIZE_BUCKETS]: didn't fold
 _seen_hands = set()
 
 # Bet sizes as a fraction of the pot before the bet: up to 0.6, up to 1.1,
@@ -85,6 +85,7 @@ BET_FRACTIONS = (0.33, 0.5, 0.75, 1.0, 1.5)     # candidate sizes, as a fraction
 STACK_OFF_EQUITY = 0.55          # if they raise our bet, call with this much equity against their raises
 RAISE_MULTIPLE = 3               # ...assuming they raise to about this many times our bet
 SIZE_PRIOR_WEIGHT = 6            # a size bucket's prior counts as this many observed bets
+LATER_FOLD_SHARE = 0.6           # once they've called a bet this hand, they fold this share as often
 STREETS_LEFT = {"flop": 3, "turn": 2, "river": 1}
 BLUFF_MAX_FRACTION = 1.0         # bets that lose when called: at most the pot
 BET_MAX_FRACTION = 1.5           # other bets: at most this (or the geometric size) ...
@@ -286,7 +287,7 @@ def update_stats(state):
                                        for e in preflop_moves)
 
         # Postflop, replaying the pot so we know how big each bet they faced was.
-        pot, street, bet_open, put_in = 0, None, False, {}
+        pot, street, bet_open, put_in, later = 0, None, False, {}, 0
         for e in entries:
             action, amount, who = e["action"], e.get("amount") or 0, e["bot_id"]
             if e["street"] != street:
@@ -299,8 +300,9 @@ def update_stats(state):
                     STATS["faced_bets"] += 1
                     STATS["raises"] += aggressive
                     STATS["calls"] += action == "call"
-                    STATS["faced_by_size"][bucket] += 1
-                    STATS["continued_by_size"][bucket] += action != "fold"
+                    STATS["faced_by_size"][later][bucket] += 1
+                    STATS["continued_by_size"][later][bucket] += action != "fold"
+                    later = later or int(action != "fold")
                 else:
                     STATS["bet_chances"] += 1
                     STATS["bets"] += aggressive
@@ -383,17 +385,38 @@ def prior_continue(fraction):
     return 0.05 + 0.95 / (1 + fraction)
 
 
-def continue_probability(fraction):
+def continued_this_hand(state):
+    """1 if the opponent has already called or raised a postflop bet this hand, else 0."""
+    me, street, bet_open = state["your_bot_id"], None, False
+    for e in state["action_log"]:
+        if e["street"] == "preflop":
+            continue
+        if e["street"] != street:
+            street, bet_open = e["street"], False
+        if e["bot_id"] != me and bet_open and e["action"] in ("call", "raise", "all_in"):
+            return 1
+        bet_open = bet_open or e["action"] in ("raise", "all_in")
+    return 0
+
+
+def continue_probability(fraction, later=0):
     """How likely this opponent is to call or raise a bet of `fraction` of the pot.
 
     Starts from the prior, scaled by how much they continue overall, then
-    learns from how they answered bets of this size.
+    learns from how they answered bets of this size. `later` is 1 once they've
+    already continued against a bet this hand: the hands left are the ones
+    that called, so they fold less (the prior folds LATER_FOLD_SHARE as often),
+    and those answers are learned separately.
     """
     overall = shrunk(STATS["raises"] + STATS["calls"], STATS["faced_bets"], 0.60) / 0.60
     bucket = size_bucket(fraction)
     typical = BUCKET_TYPICAL[bucket]
     bucket_prior = min(0.98, max(0.02, prior_continue(typical) * overall))
-    learned = shrunk(STATS["continued_by_size"][bucket], STATS["faced_by_size"][bucket],
+    if later:
+        first = shrunk(STATS["continued_by_size"][0][bucket], STATS["faced_by_size"][0][bucket],
+                       bucket_prior, SIZE_PRIOR_WEIGHT)
+        bucket_prior = 1 - (1 - first) * LATER_FOLD_SHARE
+    learned = shrunk(STATS["continued_by_size"][later][bucket], STATS["faced_by_size"][later][bucket],
                      bucket_prior, SIZE_PRIOR_WEIGHT)
     # Smooth within the bucket: a slightly bigger bet is called slightly less.
     return min(0.98, max(0.02, learned * prior_continue(fraction) / prior_continue(typical)))
@@ -416,7 +439,7 @@ def bet_ev(state, sample, extra):
     behind = pot + owed                              # the pot once we've matched their bet
     all_in = extra >= max_raise(state)
 
-    cont = continue_probability(extra / behind)
+    cont = continue_probability(extra / behind, continued_this_hand(state))
     raised = 0.0 if all_in else cont * raise_share()
     called = cont - raised
 
@@ -435,7 +458,8 @@ def bet_ev(state, sample, extra):
 
 def confirmed_station():
     """Seen calling large bets often enough that overbetting them for value is safe."""
-    faced, continued = STATS["faced_by_size"][2], STATS["continued_by_size"][2]
+    faced = sum(row[2] for row in STATS["faced_by_size"])
+    continued = sum(row[2] for row in STATS["continued_by_size"])
     return faced >= STATION_MIN_BETS and continued / faced >= STATION_CALL_RATE
 
 

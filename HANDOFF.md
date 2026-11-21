@@ -141,15 +141,12 @@ read live from disk, so **don't edit a bot while a batch is running**.
    - Hundreds of seeds, both seat orders, in parallel, in the sandbox image.
    - Report pairing wins, chips per hand, and 7-2 hands with chips won.
    - Needed because 24 matches can't separate a better bot from a lucky one.
-3. **Find out why `tag` still loses more to `baseline` than `tag_v1` does.**
-   - The baseline calls whenever its equity against a random hand beats the
-     pot odds. So it calls small bets with almost anything and folds to big
-     ones, except it calls big bets with pairs.
-   - Pull the losing hands from `--log` (see the hand-dump approach in
-     "Running and testing").
-   - Likely suspects: the call-probability prior per size, or the "callers
-     hold the strongest hands" assumption, which doesn't fit a bot that calls
-     by its equity against a random hand.
+3. ~~Find out why `tag` loses more to `baseline`~~ Done in v3: it was mostly
+   noise, plus over-bluffed later barrels (strategy.md, "Later bets get called
+   more"). Ad hoc scripts used for it: `batch.sh` (seeds in both seat orders,
+   with logs), `analyze.py` (bb won by hand type, worst hands dumped) and
+   `barrels.py` (opponent continue rates, first against later bets). They are
+   worth folding into the `tools/` harness.
 4. **Check predicted take against real results** (strategy.md 3.7). Log
    `expected_take` against actual chips won over many matches and tune
    `prior_continue`, `SIZE_PRIOR_WEIGHT`, `RAISE_MULTIPLE` and

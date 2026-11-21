@@ -311,6 +311,22 @@ knows least, a mistake costs the stack, so two limits sit on top of it:
   Overbets are allowed only once the opponent has called at least 70% of
   large bets, over at least 5.
 
+**Later bets get called more (v3).** In 83 matches against the baseline,
+opponents continued against a *first* postflop bet 56-69% of the time (turn
+and river, medium and large sizes), but 74-96% against a *later* bet in a hand
+where they'd already called one. The model used one rate for both, so it fired
+second and third barrels with 0% equity into ranges that had already called
+twice. Call rates are now learned separately for first and later bets, and
+the later prior folds 0.6 times as often as the first-bet rate
+(`LATER_FOLD_SHARE`). On the same 50 deals against the baseline: 46 of 50 wins
+(was 47, which is noise) and 2.86bb won per hand (was 2.08). Value-bet
+showdowns went from +16 to +23bb per hand. The remaining losses were all
+big-pot coolers (a straight against a full house, AA against trips).
+
+Also, the old "`tag` loses more to the baseline than `tag_v1`" result was
+small-sample noise: over 50 seeds in both seat orders, `tag` won 80 of the
+first 83 matches.
+
 `my_bots/tag_v1` is the same bot with the old fixed-size postflop play, kept
 for comparison. Results, 12 seeds in both seat orders, in the sandbox:
 
