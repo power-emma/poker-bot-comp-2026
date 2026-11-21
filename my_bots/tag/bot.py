@@ -210,6 +210,20 @@ BLUFF_MAX_FRACTION = 1.0         # bets that lose when called: at most the pot
 BET_MAX_FRACTION = 1.5           # other bets: at most this (or the geometric size) ...
 STATION_MIN_BETS = 5             # ... unless they've called at least this many large bets
 STATION_CALL_RATE = 0.7          #     at this rate or more
+# Facing a river bet, raise all-in (or close) only if at most this many opponent combos
+# beat us. A river lead into us is strong, and the range model let a king-high
+# flush jam into the nut flush for the stack (Sonnet hotseat, hand 29).
+RIVER_JAM_BEATERS = 3
+COMMIT_SHARE = 0.5               # ...and a raise of this share of our stack counts as all-in
+# Overbets (more than the pot) need at least this made hand (eval7 type: 2 =
+# two pair) that beats the board on its own; 0 = off. A7 overbet the turn on
+# 4-5-6-A into AK (Sonnet hotseat, seed 4242, hand 16).
+OVERBET_MIN_TYPE = 2
+# Out of position after the flop, a call counts this share of our equity:
+# more bets are coming and we act first. 1.0 = off. Calling the flop and turn
+# then folding the river bled chips from the big blind (same match).
+REALIZE_OOP_FLOP = 0.85
+REALIZE_OOP_TURN = 0.9
 
 # Opponent hands that haven't made a pair but have a draw rank like a middling
 # pair when we estimate their range.
@@ -391,6 +405,16 @@ def range_showdowns(hole, board, width, keep, sims, bluff=0.0):
     return results
 
 
+def beaters(hole, board):
+    """How many opponent combos beat our hand on a complete board."""
+    known = [eval7.Card(c) for c in board]
+    ours = eval7.evaluate([eval7.Card(c) for c in hole] + known)
+    used = set(hole) | set(board)
+    deck = [c for c in FULL_DECK if str(c) not in used]
+    return sum(eval7.evaluate([deck[i], deck[j]] + known) > ours
+               for i in range(len(deck)) for j in range(i + 1, len(deck)))
+
+
 def hand_label(hole, board):
     """The made hand so far, e.g. 'Two Pair' (preflop: the hand class)."""
     if not board:
@@ -409,6 +433,14 @@ def goes_all_in(state, move):
     if move["action"] == "raise":
         return move["amount"] >= state["your_stack"] + state["your_bet_this_street"]
     return move["action"] == "call" and state["amount_owed"] >= state["your_stack"]
+
+
+def commits(state, move):
+    """Would this raise put in at least COMMIT_SHARE of our stack (all-in or close to it)?"""
+    if move["action"] == "all_in":
+        return True
+    put = move["amount"] - state["your_bet_this_street"] if move["action"] == "raise" else 0
+    return put >= COMMIT_SHARE * state["your_stack"]
 
 
 def seven_two_raise(state):
@@ -846,8 +878,24 @@ def size_allowed(state, extra, eq_called):
     fraction = extra / behind
     if eq_called < 0.5 and fraction > BLUFF_MAX_FRACTION:
         return False
+    if OVERBET_MIN_TYPE and fraction > 1.0 + 1e-9 and made_type(state) < OVERBET_MIN_TYPE:
+        return False
     cap = max(BET_MAX_FRACTION, geometric_fraction(state))
     return fraction <= cap + 1e-9 or confirmed_station()
+
+
+def made_type(state):
+    """Our made hand's eval7 type (0 high card, 1 pair, 2 two pair, ...), or 1
+    if the board alone makes the same type (we're only playing the board)."""
+    board = [eval7.Card(c) for c in state["community_cards"]]
+    ours = eval7.evaluate([eval7.Card(c) for c in state["your_cards"]] + board) >> 24
+    if len(board) == 5 and eval7.evaluate(board) >> 24 >= ours:
+        return min(ours, 1)
+    if len(board) >= 3:          # board pairs count against us: 6x on K6J88 is one pair
+        ranks = [str(c)[0] for c in board]
+        if ours == 2 and any(ranks.count(r) >= 2 for r in ranks):
+            return 1
+    return ours
 
 
 def invested(state, who):
@@ -1115,7 +1163,10 @@ def postflop(state, sample):
         options = [({"action": "fold"}, 0.0, 0.0, None)]
         if not (over_cap(state, call) and eq < NUT_EQUITY
                 and eq < pot_odds(state) + call_margin()):
-            options.append(({"action": "call"}, eq * (live_pot + call) - call, 0.0, None))
+            realize = 1.0
+            if state["seat_to_act"] != state["button_seat"]:
+                realize = {"flop": REALIZE_OOP_FLOP, "turn": REALIZE_OOP_TURN}.get(state["street"], 1.0)
+            options.append(({"action": "call"}, eq * realize * (live_pot + call) - call, 0.0, None))
     owed = min(state["amount_owed"], state["your_stack"])
     bets = []
     for extra in bet_sizes(state):
@@ -1124,6 +1175,10 @@ def postflop(state, sample):
             continue
         if size_allowed(state, extra, eq_called):
             bets.append((raise_to(state, state["current_bet"] + extra), ev, take, cont))
+    if (state["street"] == "river" and state["amount_owed"] > 0
+            and any(commits(state, b[0]) for b in bets)
+            and beaters(hole, board) > RIVER_JAM_BEATERS):
+        bets = [b for b in bets if not commits(state, b[0])]
     if is_seven_two(hole):                       # 7-2 never goes all-in (strategy.md 7.1)
         bets = [b for b in bets if not goes_all_in(state, b[0])]
         options = [o for o in options if not goes_all_in(state, o[0])]
