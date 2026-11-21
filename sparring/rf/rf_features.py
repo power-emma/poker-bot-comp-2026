@@ -9,12 +9,13 @@ No hole cards (the opponent's are hidden) and no per-hand identity, to limit ove
 RF_RANKS = "23456789TJQKA"
 RF_FEATURES = ("street", "frac", "spr", "pot_bb", "paired", "suit_max", "high", "spread",
                "hands", "pfr", "bet_rate", "n_faced", "cont_rate", "raise_rate",
-               "bucket_cont", "bucket_n", "fold_to_pfr", "n_our_raises")
+               "bucket_cont", "bucket_n", "fold_to_pfr", "n_our_raises", "later")
 
 
-def rf_features(street, frac, pot_before, bb, behind, board, stats, bucket):
+def rf_features(street, frac, pot_before, bb, behind, board, stats, bucket, later=0):
     """street 'flop'|'turn'|'river'; frac = bet / pot before the bet; behind = chips the
-    bettor's opponent has left after calling; bucket = tag's size bucket for frac."""
+    bettor's opponent has left after calling; bucket = tag's size bucket for frac;
+    later = 1 once they have already continued against a bet this hand."""
     ranks = sorted(RF_RANKS.index(c[0]) for c in board)
     suits = [c[1] for c in board]
     s = stats
@@ -34,8 +35,9 @@ def rf_features(street, frac, pot_before, bb, behind, board, stats, bucket):
         faced,
         (s["raises"] + s["calls"] + 1) / (faced + 2),
         (s["raises"] + 1) / (faced + 2),
-        (s["continued_by_size"][bucket] + 1) / (s["faced_by_size"][bucket] + 2),
-        s["faced_by_size"][bucket],
+        (s["continued_by_size"][later][bucket] + 1) / (s["faced_by_size"][later][bucket] + 2),
+        s["faced_by_size"][later][bucket],
         (s["folds_to_them"] + 1) / (s["our_preflop_raises"] + 2),
         s["our_preflop_raises"],
+        later,
     ]
