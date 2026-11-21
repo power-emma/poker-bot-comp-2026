@@ -158,6 +158,15 @@ POSTFLOP_SIMS = 3000             # more than preflop: narrow calling ranges use 
 RERAISE_EQUITY = 0.60            # re-raise preflop with this much equity against their raising range
 OUT_OF_POSITION_MARGIN = 0.0     # extra equity a preflop call needs (tuned: 0.08 folded too much, v8)
 BUTTON_OPEN_TOP = 0.50           # open (raise first in) from the button with the top X% of hands
+# Between SHORT_STACK_BB and MID_STACK_BB (where most freezeout hands are
+# played once the blinds rise) open wider and smaller, re-shove over opens
+# up to RESHOVE_MAX_BB, and get it in rather than flat a re-raise.
+MID_STACK_BB = 40
+MID_OPEN_TOP = 0.75
+MID_OPEN_SIZE_BB = 2.0
+RESHOVE_MAX_BB = 25
+RESHOVE_CALL_PRIOR = 0.4         # share of their opening range assumed to call our re-shove
+PREFLOP_REALIZATION_OOP = 0.85   # share of its equity a hand realises calling a raise out of position
 BB_ISO_TOP = 0.20                # big blind raises the limping button with the top X%
 OPEN_SIZE_BB = 2.5               # button open size, in big blinds
 RERAISE_MULT = 3                 # re-raise to this multiple of their raise
@@ -226,6 +235,20 @@ BLUFF_PRIOR_RATE = 0.25          # bluff share of their showdown bets the prior 
 BLUFF_PRIOR_WEIGHT = 6           # the prior counts as this many showdown bets
 BLUFF_MAX = 0.45
 MIN_SLICE = 60                   # fewest simulations an equity slice is averaged over
+
+# Against a capable opponent (capability(), 0 to 1) we play closer to
+# equilibrium: their range can't narrow past a per-street floor (each bet and
+# call narrows it, and three streets of that overfolded rivers to Slumbot),
+# and we mix in turn and river bluffs when checked to so our checks aren't
+# all weak. Against the stations, maniacs and nits that make up most of the
+# field the exploitative model is left alone.
+CAPABLE_OBS = 40                 # their postflop decisions before the score is fully trusted
+CAPABLE_VETO = 0.15              # a continue, betting or jamming score below this: not capable
+CAPABLE_FULL_FLOOR = 0.5         # capability at which the street floor applies in full
+KEEP_STREET_FLOOR = {"flop": 0.5, "turn": 0.4, "river": 0.35}
+BALANCED_BLUFF_RATE = 0.3        # share of weak checked-to turns/rivers we bluff (times capability)
+BALANCED_BLUFF_EQUITY = 0.35     # "weak": less than this against their range
+BALANCED_BLUFF_MAX = 0.75        # bluff at most this fraction of the pot
 
 # Early in the match, while the model knows little, keep pots small: a skill
 # edge wins more often over many small pots than one big one. We commit at
@@ -521,7 +544,7 @@ def update_stats(state):
             elif short and e is first_raise:
                 STATS["our_shoves"] += 1
                 STATS["shoves_called"] += reply["action"] != "fold"
-            elif short:
+            elif depth is not None and depth <= RESHOVE_MAX_BB:
                 STATS["our_reshoves"] += 1
                 STATS["reshoves_called"] += reply["action"] != "fold"
 
@@ -626,6 +649,41 @@ def preflop_width(state, raises):
     return max(width, 0.03)
 
 
+def closeness(value, target, tolerance):
+    """1 at `target`, falling to 0 at `tolerance` away."""
+    return max(0.0, 1 - abs(value - target) / tolerance)
+
+
+def capability():
+    """0 to 1: how much this opponent looks like a balanced, capable player.
+
+    Each trait is scored by how close it is to what a sound player does, and
+    the score is their average, except that an extreme continue rate (station
+    or folder), betting rate (maniac or nit) or deep jamming vetoes it: those
+    are the bots our extra calls and bluffs lose to. Scaled down until we've
+    seen CAPABLE_OBS of their postflop decisions. Tuned on 150-hand probes:
+    Slumbot and v8 score high, tag_v1 middling, the sparring bots near 0.
+    """
+    seen = STATS["faced_bets"] + STATS["bet_chances"]
+    if not seen:
+        return 0.0
+    cont = STATS["raises"] + STATS["calls"]
+    scores = [
+        closeness(cont / max(1, STATS["faced_bets"]) if STATS["faced_bets"] else 0.6, 0.6, 0.3),
+        closeness(STATS["bets"] / STATS["bet_chances"] if STATS["bet_chances"] else 0.45, 0.45, 0.35),
+        closeness(STATS["raises"] / cont if cont else 0.2, 0.2, 0.25),
+        closeness(STATS["sb_open_raises"] / STATS["sb_opportunities"] if STATS["sb_opportunities"] else 0.75,
+                  0.75, 0.5),
+        1 - min(1.0, STATS["deep_jams"] / max(1, STATS["deep_jam_chances"]) / 0.15),
+    ]
+    if STATS["sd_bets"] >= 4:
+        scores.append(closeness(STATS["sd_bluffs"] / STATS["sd_bets"], 0.3, 0.3))
+    if min(scores[0], scores[1], scores[4]) < CAPABLE_VETO:
+        return 0.0
+    score = max(0.0, min(1.0, (sum(scores) / len(scores) - 0.45) / 0.3))
+    return score * min(1.0, seen / CAPABLE_OBS)
+
+
 def opponent_range(state):
     """(width, keep) for range_equity, from what the opponent did this hand.
 
@@ -657,7 +715,8 @@ def opponent_range(state):
                 keep *= continue_freq
         bet_open = bet_open or aggressive
     seen = STATS["bet_chances"] + STATS["faced_bets"]
-    keep = max(keep, KEEP_FLOOR * max(0.0, 1 - seen / KEEP_TRUST_OBS))
+    keep = max(keep, KEEP_FLOOR * max(0.0, 1 - seen / KEEP_TRUST_OBS),
+               min(1.0, capability() / CAPABLE_FULL_FLOOR) * KEEP_STREET_FLOOR.get(state["street"], 0.0))
     return width, keep, bluff_share(state)
 
 
@@ -983,14 +1042,25 @@ def preflop(state, cls, top):
         return {"action": "call" if eq >= pot_odds(state) else "fold"}
     if eff <= SHORT_STACK_BB:
         return short_stack(state, cls, eff, on_button, raises)
+    mid = eff <= MID_STACK_BB
 
-    # Button, first in: raise to 2.5bb or fold.
+    # Button, first in: raise (2.5bb, 2bb at mid stacks) or fold.
     if on_button and not they_raised:
         steal_72o = cls == "72o" and STATS["our_preflop_raises"] >= 8 \
             and opponent_folds_to_raise() > 0.60
-        if top <= BUTTON_OPEN_TOP or cls == "72s" or steal_72o:
-            return raise_to(state, OPEN_SIZE_BB * bb)
+        if top <= (MID_OPEN_TOP if mid else BUTTON_OPEN_TOP) or cls == "72s" or steal_72o:
+            return raise_to(state, (MID_OPEN_SIZE_BB if mid else OPEN_SIZE_BB) * bb)
         return {"action": "fold"}
+
+    # Their open, nothing from us yet, up to RESHOVE_MAX_BB: re-shove when it beats calling and folding.
+    if eff <= RESHOVE_MAX_BB and len(raises) == 1 and they_raised and not state["can_check"]:
+        width = preflop_width(state, raises)
+        call_rate = shrunk(STATS["reshoves_called"], STATS["our_reshoves"], RESHOVE_CALL_PRIOR,
+                           SHOVE_PRIOR_WEIGHT)
+        owed = state["amount_owed"]
+        call_ev = preflop_equity(state, cls, width) * PREFLOP_REALIZATION_OOP * (state["pot"] + owed) - owed
+        if reshove_ev(state, cls, width, call_rate) > max(0, call_ev):
+            return {"action": "all_in"}
 
     # Big blind, the button just called: raise our good hands, check the rest.
     if state["can_check"]:
@@ -1008,7 +1078,10 @@ def preflop(state, cls, top):
     margin = OUT_OF_POSITION_MARGIN + OOP_EARLY_EXTRA * max(0.0, 1 - STATS["hands"] / OOP_TRUST_HANDS)
     if top > PREMIUM_TOP and over_cap(state, state["amount_owed"]):
         margin += call_margin()
-    if eq >= pot_odds(state) + margin:
+    realized = eq if on_button else eq * PREFLOP_REALIZATION_OOP
+    if realized >= pot_odds(state) + margin:
+        if mid and we_raised:
+            return {"action": "all_in"}          # a flat call here leaves too little behind to play
         return {"action": "call"}
     if we_raised:
         return {"action": "fold"}
@@ -1065,6 +1138,18 @@ def postflop(state, sample):
 
     best = max(options + bets, key=lambda o: o[1])
 
+    # Against a capable opponent, bluff some weak turns and rivers we'd check,
+    # so they can't bet freely whenever we check.
+    capable = capability()
+    balanced_bluff = False
+    if (capable and state["can_check"] and state["street"] in ("turn", "river")
+            and best[0]["action"] == "check" and eq < BALANCED_BLUFF_EQUITY
+            and random.random() < capable * BALANCED_BLUFF_RATE):
+        small = [b for b in bets if b[0]["action"] == "raise"
+                 and b[0]["amount"] - state["current_bet"] <= BALANCED_BLUFF_MAX * pot]
+        if small:
+            best, balanced_bluff = max(small, key=lambda o: o[1]), True
+
     # 7-2 suited with a flush draw: play it like a high flush draw (strategy.md 7.1),
     # raising to build the pot but never all-in.
     if flush_draw_72s(hole, board) and best[0]["action"] in ("check", "call", "fold") and bets:
@@ -1074,7 +1159,10 @@ def postflop(state, sample):
             best = max(bets, key=lambda o: o[1])                           # semi-bluff
 
     move, ev, take, cont = best
-    info = {"ev": round(ev), "check_or_call_ev": round(max(o[1] for o in options))}
+    info = {"ev": round(ev), "check_or_call_ev": round(max(o[1] for o in options)),
+            "capable": round(capable, 2)}
+    if balanced_bluff:
+        info["balanced_bluff"] = True
     if cont is not None:
         info.update(expected_take=round(take), call_chance=round(cont, 2))
     return move, info
