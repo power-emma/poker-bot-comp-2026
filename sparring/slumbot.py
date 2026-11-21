@@ -66,22 +66,46 @@ def load_bot(path):
 
 
 class Hand:
-    """Replays a Slumbot action string. pos 0 = big blind, pos 1 = small blind (button)."""
+    """Replays a Slumbot action string. pos 0 = big blind, pos 1 = small blind (button).
 
-    def __init__(self, action, client_pos, hand_num):
-        self.me, self.hand_num = client_pos, hand_num
+    `cap` emulates a shorter stack: the bot sees stacks, pot and bets as if each
+    player had `cap` chips, a Slumbot bet past that is an all-in it can only
+    call or fold, and capped_result() scores the hand at that depth. Slumbot
+    itself still plays its 200bb strategy, so this approximates a short-stack
+    opponent rather than being one.
+    """
+
+    def __init__(self, action, client_pos, hand_num, cap=STACK):
+        self.me, self.hand_num, self.cap = client_pos, hand_num, cap
         self.ids = {client_pos: ME, 1 - client_pos: SLUM}
         self.seat = {client_pos: 0, 1 - client_pos: 1}
         self.committed = {0: BB, 1: SB}
         self.street_bet = {0: BB, 1: SB}
         self.street, self.to_act, self.last_size, self.n_on_street = 0, 1, BB - SB, 0
-        self.over = False
+        self.over, self.folder = False, None
         self.log = [self._entry(1, "small_blind", SB), self._entry(0, "big_blind", BB)]
         self._replay(action)
 
     def _entry(self, pos, action, amount):
         return {"seat": self.seat[pos], "bot_id": self.ids[pos], "action": action,
                 "amount": amount, "street": STREETS[min(self.street, 3)], "hand_num": self.hand_num}
+
+    def capped(self, p):
+        """Chips `p` has in the pot, counting at most the cap."""
+        return min(self.committed[p], self.cap)
+
+    def street_capped(self, p):
+        """Chips `p` has in on this street, counting at most the cap overall."""
+        return self.capped(p) - min(self.committed[p] - self.street_bet[p], self.cap)
+
+    def all_in_matched(self):
+        """Someone is all-in at the cap and the other has matched it: nothing left to decide."""
+        return max(self.capped(0), self.capped(1)) >= self.cap and self.capped(0) == self.capped(1)
+
+    def _log(self, p, action, amount):
+        if self.capped(p) >= self.cap and action != "fold" or self.all_in_matched():
+            return                                          # an all-in player doesn't act
+        self.log.append(self._entry(p, action, amount))
 
     def _close_street(self):
         if self.street == 3:
@@ -100,11 +124,11 @@ class Hand:
                 continue                                   # street ends are inferred from the action
             p, o = self.to_act, 1 - self.to_act
             if c == "f":
-                self.log.append(self._entry(p, "fold", 0))
-                self.over = True
+                self._log(p, "fold", 0)
+                self.over, self.folder = True, p
                 return
             if c == "k":
-                self.log.append(self._entry(p, "check", 0))
+                self._log(p, "check", 0)
                 self.n_on_street += 1
                 if self.n_on_street >= 2:
                     self._close_street()
@@ -112,9 +136,10 @@ class Hand:
                     self.to_act = o
             elif c == "c":
                 add = self.street_bet[o] - self.street_bet[p]
+                before = self.capped(p)
+                self._log(p, "call", min(self.committed[p] + add, self.cap) - before)
                 self.street_bet[p] += add
                 self.committed[p] += add
-                self.log.append(self._entry(p, "call", add))
                 self.n_on_street += 1
                 self.last_size = 0
                 if self.committed[p] >= STACK:             # all-in called: run it out
@@ -130,35 +155,41 @@ class Hand:
                     i += 1
                 to = int(s[j:i])
                 add = to - self.street_bet[p]
+                prev = min(self.committed[p] - self.street_bet[p], self.cap)
+                kind = "all_in" if self.committed[p] + add >= self.cap else "raise"
+                self._log(p, kind, min(to, self.cap - prev))
                 self.last_size = to - self.street_bet[o]
                 self.street_bet[p] = to
                 self.committed[p] += add
-                kind = "all_in" if self.committed[p] >= STACK else "raise"
-                self.log.append(self._entry(p, kind, to))
                 self.n_on_street += 1
                 self.to_act = o
             else:
                 raise ValueError(f"bad action char {c!r} in {s!r}")
 
+    def needs_decision(self):
+        """False when the bot has nothing to decide at the capped depth (it, or both, are all-in)."""
+        return self.capped(self.me) < self.cap and not self.all_in_matched()
+
     def state(self, hole, board, match_log):
         me, op = self.me, 1 - self.me
-        stack = STACK - self.committed[me]
-        owed = max(0, self.street_bet[op] - self.street_bet[me])
-        cur = max(self.street_bet.values())
-        min_to = min(cur + max(self.last_size, BB), self.street_bet[me] + stack)
+        stack = self.cap - self.capped(me)
+        bets = {p: self.street_capped(p) for p in (0, 1)}
+        owed = max(0, bets[op] - bets[me])
+        cur = max(bets.values())
+        min_to = min(cur + max(self.last_size, BB), bets[me] + stack)
         sb_seat = self.seat[1]
         players = []
         for pos in (me, op):
-            st = STACK - self.committed[pos]
+            st = self.cap - self.capped(pos)
             players.append({"seat": self.seat[pos], "bot_id": self.ids[pos], "stack": st,
                             "state": "all_in" if st == 0 else "active", "is_folded": False,
-                            "is_all_in": st == 0, "bet_this_street": self.street_bet[pos], "hole_cards": None})
+                            "is_all_in": st == 0, "bet_this_street": bets[pos], "hole_cards": None})
         players.sort(key=lambda p: p["seat"])
         alog = [{k: v for k, v in e.items() if k != "hand_num"} for e in self.log]
         return {
             "your_cards": list(hole), "community_cards": list(board), "street": STREETS[self.street],
-            "pot": sum(self.committed.values()), "your_stack": stack,
-            "your_bet_this_street": self.street_bet[me], "amount_owed": owed, "can_check": owed == 0,
+            "pot": self.capped(0) + self.capped(1), "your_stack": stack,
+            "your_bet_this_street": bets[me], "amount_owed": owed, "can_check": owed == 0,
             "current_bet": cur, "min_raise_to": min_to, "your_bot_id": ME, "seat_to_act": self.seat[me],
             "button_seat": sb_seat, "sb_seat": sb_seat, "bb_seat": self.seat[0],
             "hand_num": self.hand_num, "hand_id": f"slum-{self.hand_num}",
@@ -166,33 +197,48 @@ class Hand:
             "action_log": alog, "match_action_log": (match_log + self.log)[-200:], "time_limit_ms": 2000,
         }
 
+    def passive(self):
+        return "c" if self.street_bet[1 - self.me] > self.street_bet[self.me] else "k"
+
     def to_incr(self, reply):
         """The bot's reply -> Slumbot's incremental action, following the engine's rules."""
         me, op = self.me, 1 - self.me
-        stack = STACK - self.committed[me]
-        owed = max(0, self.street_bet[op] - self.street_bet[me])
-        max_to = self.street_bet[me] + stack
+        owed = self.street_bet[op] > self.street_bet[me]
+        max_to = self.street_bet[me] + (self.cap - self.committed[me])     # our all-in at the cap
         a = (reply or {}).get("action") if isinstance(reply, dict) else None
-        passive = "c" if owed else "k"
+        passive = self.passive()
         if a in ("check", "call"):
             return passive
         if a in ("raise", "all_in"):
-            if STACK - self.committed[op] == 0 or max_to <= self.street_bet[op]:
+            if self.cap - self.capped(op) == 0 or max_to <= self.street_bet[op]:
                 return passive                             # nothing to raise into
-            if a == "all_in":
-                return f"b{max_to}"
-            try:
-                amt = int(reply.get("amount"))
-            except (TypeError, ValueError):
-                return "f" if owed else "k"
             cur = max(self.street_bet.values())
-            amt = max(amt, min(cur + max(self.last_size, BB), max_to))
-            return f"b{min(amt, max_to)}"
+            legal_min = cur + max(self.last_size, BB)      # Slumbot's minimum (it doesn't know the cap)
+            if a == "all_in":
+                amt = max_to
+            else:
+                try:
+                    amt = int(reply.get("amount"))
+                except (TypeError, ValueError):
+                    return "f" if owed else "k"
+                amt = min(max(amt, legal_min), max_to)
+            if amt < legal_min:
+                return passive                             # a capped all-in below a legal raise: call
+            return f"b{amt}"
         return "f" if owed else "k"                       # fold, or anything unknown
+
+    def capped_result(self, winnings):
+        """Our net chips at the capped depth, given Slumbot's (200bb) result."""
+        if self.cap >= STACK:
+            return winnings
+        if self.folder is not None:
+            return -self.capped(self.me) if self.folder == self.me else self.capped(1 - self.me)
+        matched = min(self.capped(0), self.capped(1))
+        return matched if winnings > 0 else -matched if winnings < 0 else 0
 
 
 def worker(task):
-    bot_path, n_hands, wid, seed, verbose = task
+    bot_path, n_hands, wid, seed, verbose, cap = task
     random.seed(seed)
     try:
         import numpy as np
@@ -211,7 +257,11 @@ def worker(task):
             token = r.get("token") or token
             decisions = []
             while "winnings" not in r:
-                hand = Hand(r.get("action", ""), r["client_pos"], h)
+                hand = Hand(r.get("action", ""), r["client_pos"], h, cap)
+                if not hand.needs_decision():              # all-in at the capped depth: check/call it down
+                    r = post("act", {"token": token, "incr": hand.passive()})
+                    token = r.get("token") or token
+                    continue
                 st = hand.state(r["hole_cards"], r.get("board", []), match_log)
                 t0 = time.time()
                 try:
@@ -225,7 +275,7 @@ def worker(task):
                 r = post("act", {"token": token, "incr": incr})
                 token = r.get("token") or token
             action = r.get("action", "")
-            hand = Hand(action, r["client_pos"], h)
+            hand = Hand(action, r["client_pos"], h, cap)
             match_log.extend(hand.log)
             showdown = not action.endswith("f")
             if showdown and r.get("bot_hole_cards"):
@@ -233,7 +283,7 @@ def worker(task):
                     match_log.append({"seat": hand.seat[pos], "bot_id": hand.ids[pos], "action": "show",
                                       "amount": 0, "cards": list(cards), "street": "showdown", "hand_num": h})
             match_log = match_log[-400:]
-            rec = {"w": wid, "h": h, "pos": "SB" if r["client_pos"] == 1 else "BB", "won": r["winnings"],
+            rec = {"w": wid, "h": h, "pos": "SB" if r["client_pos"] == 1 else "BB", "won": hand.capped_result(r["winnings"]), "raw_won": r["winnings"],
                    "hole": r["hole_cards"], "opp": r.get("bot_hole_cards"), "board": r.get("board", []),
                    "action": action, "showdown": showdown, "end_street": STREETS[min(hand.street, 3)],
                    "decisions": decisions}
@@ -336,6 +386,8 @@ def main():
     ap.add_argument("--hands", type=int, default=500, help="total hands (split across workers)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--stack-bb", type=int, default=STACK // BB,
+                    help="emulate this stack depth (default 200, Slumbot's own); scored at that depth")
     ap.add_argument("--log", help="write every hand as JSON lines")
     ap.add_argument("--load", help="skip playing; summarize an earlier --log file")
     ap.add_argument("-v", "--verbose", action="store_true", help="print every hand")
@@ -345,7 +397,8 @@ def main():
         summarize([json.loads(l) for l in open(a.load)])
         return
     per = [a.hands // a.workers + (1 if i < a.hands % a.workers else 0) for i in range(a.workers)]
-    tasks = [(a.bot, n, i, a.seed * 1000 + i, a.verbose) for i, n in enumerate(per) if n]
+    cap = min(STACK, a.stack_bb * BB)
+    tasks = [(a.bot, n, i, a.seed * 1000 + i, a.verbose, cap) for i, n in enumerate(per) if n]
     t0 = time.time()
     hands = []
     with ProcessPoolExecutor(len(tasks)) as ex:
