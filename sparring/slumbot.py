@@ -29,6 +29,7 @@ import urllib.error
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import Lock, Value
 from pathlib import Path
 
 HOST = "https://slumbot.com/slumbot/api/"
@@ -237,6 +238,27 @@ class Hand:
         return matched if winnings > 0 else -matched if winnings < 0 else 0
 
 
+# Running totals shared by the workers, for --every progress lines.
+_PROGRESS = None
+
+
+def _init_progress(count, total, lock, every, t0):
+    global _PROGRESS
+    _PROGRESS = (count, total, lock, every, t0)
+
+
+def report_progress(won):
+    if not _PROGRESS:
+        return
+    count, total, lock, every, t0 = _PROGRESS
+    with lock:
+        count.value += 1
+        total.value += won
+        if every and count.value % every == 0:
+            n, bb = count.value, total.value / BB
+            print(f"{n} hands: {bb / n * 100:+.1f} bb/100 (total {bb:+.0f} bb, {time.time() - t0:.0f}s)", flush=True)
+
+
 def worker(task):
     bot_path, n_hands, wid, seed, verbose, cap = task
     random.seed(seed)
@@ -288,6 +310,7 @@ def worker(task):
                    "action": action, "showdown": showdown, "end_street": STREETS[min(hand.street, 3)],
                    "decisions": decisions}
             out.append(rec)
+            report_progress(rec["won"])
             if verbose:
                 print(f"[w{wid} {h:4d}] {rec['pos']} {' '.join(rec['hole'])} | {' '.join(rec['board']):<14} "
                       f"| {action:<30} | {rec['won']:+6d}  vs {' '.join(rec['opp'] or [])}", flush=True)
@@ -389,6 +412,7 @@ def main():
     ap.add_argument("--stack-bb", type=int, default=STACK // BB,
                     help="emulate this stack depth (default 200, Slumbot's own); scored at that depth")
     ap.add_argument("--log", help="write every hand as JSON lines")
+    ap.add_argument("--every", type=int, default=100, help="print running bb/100 every N hands (0 = off)")
     ap.add_argument("--load", help="skip playing; summarize an earlier --log file")
     ap.add_argument("-v", "--verbose", action="store_true", help="print every hand")
     a = ap.parse_args()
@@ -401,7 +425,8 @@ def main():
     tasks = [(a.bot, n, i, a.seed * 1000 + i, a.verbose, cap) for i, n in enumerate(per) if n]
     t0 = time.time()
     hands = []
-    with ProcessPoolExecutor(len(tasks)) as ex:
+    progress = (Value("i", 0), Value("d", 0.0), Lock(), a.every, t0)
+    with ProcessPoolExecutor(len(tasks), initializer=_init_progress, initargs=progress) as ex:
         for res in ex.map(worker, tasks):
             hands.extend(res)
     print(f"played in {time.time() - t0:.0f}s")
