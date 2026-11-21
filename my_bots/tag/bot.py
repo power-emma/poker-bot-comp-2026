@@ -151,6 +151,10 @@ PREFLOP_RANGE_SIMS = 1000
 POSTFLOP_SIMS = 3000             # more than preflop: narrow calling ranges use a slice of them
 RERAISE_EQUITY = 0.60            # re-raise preflop with this much equity against their raising range
 OUT_OF_POSITION_MARGIN = 0.08    # extra equity a preflop call needs, for the streets still to play
+BUTTON_OPEN_TOP = 0.50           # open (raise first in) from the button with the top X% of hands
+BB_ISO_TOP = 0.20                # big blind raises the limping button with the top X%
+OPEN_SIZE_BB = 2.5               # button open size, in big blinds
+RERAISE_MULT = 3                 # re-raise to this multiple of their raise
 
 # Opponent stats, kept for the whole match (the process lasts one match).
 STATS = {
@@ -806,13 +810,13 @@ def preflop(state, cls, top):
     if on_button and not they_raised:
         steal_72o = cls == "72o" and STATS["our_preflop_raises"] >= 8 \
             and opponent_folds_to_raise() > 0.60
-        if top <= 0.50 or cls == "72s" or steal_72o:
-            return raise_to(state, 2.5 * bb)
+        if top <= BUTTON_OPEN_TOP or cls == "72s" or steal_72o:
+            return raise_to(state, OPEN_SIZE_BB * bb)
         return {"action": "fold"}
 
     # Big blind, the button just called: raise our good hands, check the rest.
     if state["can_check"]:
-        return raise_to(state, 4 * bb) if top <= 0.20 else {"action": "check"}
+        return raise_to(state, 4 * bb) if top <= BB_ISO_TOP else {"action": "check"}
 
     # Facing a raise: compare our hand with the hands this opponent raises with
     # (wide for a maniac, narrow for a nit). Re-raise when well ahead of that
@@ -822,7 +826,7 @@ def preflop(state, cls, top):
         eq = equity_vs_top(cls, width)
     else:
         eq = range_equity(state["your_cards"], [], width, 1.0, sims=PREFLOP_RANGE_SIMS)
-    reraise = 3 * state["current_bet"]
+    reraise = RERAISE_MULT * state["current_bet"]
     if eq >= RERAISE_EQUITY and (top <= PREMIUM_TOP
                                  or not over_cap(state, reraise - state["your_bet_this_street"])):
         return raise_to(state, reraise)
