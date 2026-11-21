@@ -58,6 +58,21 @@ class Collect:
         return {}
 
 
+def already_continued(action_log, who):
+    """Has `who` already called or raised a postflop bet earlier this hand? (tag's `later` flag)"""
+    street, bet_open = None, False
+    for e in action_log:
+        if e["street"] == "preflop":
+            continue
+        if e["street"] != street:
+            street, bet_open = e["street"], False
+        agg = e["action"] in ("raise", "all_in")
+        if e["bot_id"] == who and bet_open and e["action"] in ("call", "raise", "all_in"):
+            return True
+        bet_open = bet_open or agg
+    return False
+
+
 def run_one(task):
     tag_path, opp_path, opp_name, split, seed, tag_first = task
     from pokercore import structures
@@ -102,9 +117,10 @@ def run_one(task):
             a = e["applied"]["action"]
             label = 0 if a == "fold" else 2 if a in ("raise",) or (a == "all_in" and e["applied"]["amount"] > st["current_bet"]) else 1
             behind = max(0, st["your_stack"] - owed)
+            later = int(already_continued(st["action_log"], "opp"))
             x = rf_features(st["street"], frac, before, st["blinds"]["bb"], behind, st["community_cards"],
-                            stats, mod.size_bucket(frac))
-            rows.append((x, label, opp_name, split, h, mod.continue_probability(frac), mod.raise_share()))
+                            stats, mod.size_bucket(frac), later)
+            rows.append((x, label, opp_name, split, h, mod.continue_probability(frac, later), mod.raise_share()))
         last = evs[-1]
         done = [dict(x, hand_num=h) for x in last["state"]["action_log"]]
         done.append({"hand_num": h, "seat": last["seat"], "bot_id": last["bot"], "street": last["street"],
