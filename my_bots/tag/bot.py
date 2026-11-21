@@ -2,22 +2,23 @@
 Tight-aggressive bot with value betting by expected take (see strategy.md).
 
   - Preflop: every starting hand has a "top %" from a table of equity against a
-    random hand. Deep stacks play TAG ranges; at 15 big blinds or less it's
-    push or fold.
+    random hand. Deep stacks play TAG ranges; at 15 big blinds or less we
+    open-shove or fold and can flat-call a smaller opposing raise.
   - Postflop: Monte Carlo equity against the opponent's estimated range (the
     hands that would have bet, raised and called the way they did this hand,
     given how often this opponent does each). Every option (check, call, fold,
     and each bet size) is scored by EV: how likely this opponent is to fold,
     call or raise at that size, and our equity against the hands that call.
-  - Short stacks: push or fold. Pushes are a best response to the range this
-    opponent calls shoves with, and calls of a shove need our equity against
-    their shoving range to beat the pot odds. Both ranges start at the Nash
-    push/fold equilibrium (tools/pushfold_nash.py) and move toward what we see.
+  - Short stacks: open-shoves use the range this opponent calls shoves with.
+    Against a raise, compare a flat call with a shove if both players still
+    have chips to bet. Shove ranges use Nash priors (tools/pushfold_nash.py)
+    and adjust to observed frequencies.
   - Seven-two suited is played as a slightly better hand than its rank, and
     its flush draws like high flush draws (strategy.md 7.1). Seven-two offsuit
     folds unless the opponent folds too much to preflop raises.
 """
 
+import bisect
 import json
 import os
 import random
@@ -126,8 +127,8 @@ NASH_PUSH_FOLD = {
 
 # All-in equity of every class against every class, and how many combos of
 # the second don't share a card with the first (data/preflop_equity.json,
-# written by tools/pushfold_nash.py). None if the file is missing: the short
-# stack play then falls back to the Nash chart alone.
+# written by tools/pushfold_nash.py). If the file is missing, open shoves
+# use the Nash chart and other preflop equity estimates use simulation.
 def _load_matrix():
     folder = os.environ.get("BOT_DATA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     try:
@@ -147,6 +148,11 @@ if CLASS_INDEX:
 
 SHORT_STACK_BB = 15
 SHOVE_PRIOR_WEIGHT = 8           # the Nash range counts as this many observed shoves
+DEEP_JAM_PRIOR = 0.08            # deeper than SHORT_STACK_BB: share of their preflop decisions that are all-ins
+DEEP_JAM_PRIOR_WEIGHT = 3        # ...counting as this many decisions (light: an any-two shover busts us fast)
+# Discount checkdown equity for the betting left after a short-stack flat call.
+SHORT_CALL_REALIZATION_IP = 0.90
+SHORT_CALL_REALIZATION_OOP = 0.80
 PREFLOP_RANGE_SIMS = 1000
 POSTFLOP_SIMS = 3000             # more than preflop: narrow calling ranges use a slice of them
 RERAISE_EQUITY = 0.60            # re-raise preflop with this much equity against their raising range
@@ -159,18 +165,24 @@ RERAISE_MULT = 3                 # re-raise to this multiple of their raise
 # Opponent stats, kept for the whole match (the process lasts one match).
 STATS = {
     "our_preflop_raises": 0, "folds_to_them": 0,   # their folds to our first preflop raise
-    "hands": 0, "preflop_raised": 0,               # hands seen, hands they raised preflop
-    "faced_our_raises": 0, "reraises": 0,          # preflop, every raise of ours they answered: raised again?
+    "hands": 0,
+    "sb_opportunities": 0, "sb_open_raises": 0,   # excluding shoves from the raise count
+    "bb_limp_opportunities": 0, "bb_iso_raises": 0,
+    "faced_our_raises": 0, "reraises": 0, "reraise_shoves": 0,
     "bet_chances": 0, "bets": 0,                   # postflop, nothing to call: did they bet?
     "faced_bets": 0, "calls": 0, "raises": 0,      # postflop, facing a bet: call / raise?
     "faced_by_size": [[0, 0, 0, 0], [0, 0, 0, 0]], # ... the same, split by [already continued
     "continued_by_size": [[0, 0, 0, 0], [0, 0, 0, 0]],  # against a bet this hand][size bucket,
                                                    # see SIZE_BUCKETS]: didn't fold
-    "short_sb_hands": 0, "short_pushes": 0,        # short stacks, they're first in: raised?
-    "our_shoves": 0, "shoves_called": 0,           # short stacks, our preflop all-ins: called?
+    "short_sb_hands": 0, "short_open_shoves": 0, "deep_open_shoves": 0,
+    "our_shoves": 0, "shoves_called": 0,           # short-stack open shoves
+    "our_reshoves": 0, "reshoves_called": 0,       # short-stack shoves after their raise
+    "sd_bets": 0, "sd_bluffs": 0,                  # their last postflop bet in hands they showed: a bluff?
+    "deep_jam_chances": 0, "deep_jams": 0,         # deep stacks, any preflop decision of theirs: all-in?
 }
 _seen_hands = set()
 _depth_by_hand = {}                                # hand -> effective stack (bb) when we last acted
+_board_by_hand = {}                                # hand -> the most board we saw (the log has no boards)
 
 # Bet sizes as a fraction of the pot before the bet: up to 0.6, up to 1.1,
 # up to 2.5, overbets (usually all-ins). Each bucket's typical size is used
@@ -203,6 +215,17 @@ RANGE_PRIOR_WEIGHT = 4
 # comes in), so a barely-seen opponent isn't read as holding only the nuts.
 KEEP_FLOOR = 0.3
 KEEP_TRUST_OBS = 20
+# A bet's range is polarised: the strongest `keep` share, plus bluffs drawn
+# from the rest. Without them every bet narrows their range to strong hands
+# only and we overfold (v8 folded 85% of rivers to Slumbot's half-pot bets,
+# where the most a defender can fold is 33%). The bluff share starts at the
+# equilibrium ratio for the size, f / (1 + 2f), and is scaled by how often
+# this opponent's bets that reached showdown were bluffs (a hand weaker than
+# DRAW_SCORE when they bet), so a bot that never bluffs is soon read as one.
+BLUFF_PRIOR_RATE = 0.25          # bluff share of their showdown bets the prior assumes
+BLUFF_PRIOR_WEIGHT = 6           # the prior counts as this many showdown bets
+BLUFF_MAX = 0.45
+MIN_SLICE = 60                   # fewest simulations an equity slice is averaged over
 
 # Early in the match, while the model knows little, keep pots small: a skill
 # edge wins more often over many small pots than one big one. We commit at
@@ -280,21 +303,31 @@ class RangeSample:
     """Simulated showdowns against the opponent's estimated range.
 
     The range is every hand in the top `width` of starting hands, then the
-    strongest `keep` share of those on this board, ordered strongest first.
-    Each simulation records which hand in that order the opponent held, so
-    `equity(share)` gives our equity against just the strongest `share` of the
-    range (the hands that would call a big bet) from the same simulations.
+    strongest `keep` share of those on this board, plus a `bluff` share drawn
+    from the weaker rest. Each simulation records where the opponent's hand
+    sits in that range (0 = strongest, 1 = weakest, by probability), so
+    `equity(share, skip)` gives our equity against a slice of the range, so
+    calls and raises can use separate parts of the same simulations.
     """
 
-    def __init__(self, hole, board, width, keep, sims=SIMULATIONS):
-        self.results = range_showdowns(hole, board, width, keep, sims)
-        self.size = max(i for i, _ in self.results) + 1 if self.results else 1
+    def __init__(self, hole, board, width, keep, sims=SIMULATIONS, bluff=0.0):
+        self.results = sorted(range_showdowns(hole, board, width, keep, sims, bluff))
+        self.positions = [p for p, _ in self.results]
 
-    def equity(self, share=1.0):
-        """Equity (ties count half) against the strongest `share` of the range."""
-        cutoff = max(MIN_RANGE_COMBOS, round(self.size * share))
-        outcomes = [r for i, r in self.results if i < cutoff]
-        return sum(outcomes) / len(outcomes) if outcomes else 0.5
+    def equity(self, share=1.0, skip=0.0):
+        """Equity between the two percentiles, ordered from strongest to weakest."""
+        n = len(self.results)
+        if not n:
+            return 0.5
+        if share >= 1.0 and skip <= 0.0:
+            return sum(result for _, result in self.results) / n
+        lo, hi = bisect.bisect_left(self.positions, skip), bisect.bisect_left(self.positions, share)
+        short = min(MIN_SLICE, n) - (hi - lo)
+        if short > 0:                            # too few: widen evenly, within bounds
+            lo = max(0, lo - (short + 1) // 2)
+            hi = min(n, lo + min(MIN_SLICE, n))
+            lo = max(0, hi - min(MIN_SLICE, n))
+        return sum(result for _, result in self.results[lo:hi]) / (hi - lo)
 
 
 def range_equity(hole, board, width, keep, sims=SIMULATIONS):
@@ -302,8 +335,8 @@ def range_equity(hole, board, width, keep, sims=SIMULATIONS):
     return RangeSample(hole, board, width, keep, sims).equity()
 
 
-def range_showdowns(hole, board, width, keep, sims):
-    """[(index of the opponent's hand in the range, our result 1 / 0.5 / 0)] per simulation."""
+def range_showdowns(hole, board, width, keep, sims, bluff=0.0):
+    """[(position of the opponent's hand in the range, our result 1 / 0.5 / 0)] per simulation."""
     hero = [eval7.Card(c) for c in hole]
     known = [eval7.Card(c) for c in board]
     used = set(hole) | set(board)
@@ -320,16 +353,25 @@ def range_showdowns(hole, board, width, keep, sims):
     candidates.sort(key=lambda x: -x[0])
     n = min(len(candidates), max(MIN_RANGE_COMBOS, round(len(candidates) * keep)))
     opp_range = [opp for _, opp in candidates[:n]]
+    rest = [opp for _, opp in candidates[n:]]
+    if not rest:
+        bluff = 0.0
 
     results = []
     for _ in range(sims):
-        index = random.randrange(n)
-        opp = opp_range[index]
+        if bluff and random.random() < bluff:
+            index = random.randrange(len(rest))
+            opp = rest[index]
+            position = (1 - bluff) + bluff * (index + random.random()) / len(rest)
+        else:
+            index = random.randrange(n)
+            opp = opp_range[index]
+            position = (1 - bluff) * (index + random.random()) / n
         drawn = random.sample(deck, to_come + 2)
         full_board = known + [c for c in drawn if c not in opp][:to_come]
         ours = eval7.evaluate(hero + full_board)
         theirs = eval7.evaluate(opp + full_board)
-        results.append((index, 1.0 if ours > theirs else 0.5 if ours == theirs else 0.0))
+        results.append((position, 1.0 if ours > theirs else 0.5 if ours == theirs else 0.0))
     return results
 
 
@@ -410,11 +452,18 @@ def effective_bb(state):
     return min(ours, theirs) / state["blinds"]["bb"]
 
 
-def preflop_raises(state, by_us):
-    me = state["your_bot_id"]
-    return sum(1 for e in state["action_log"]
-               if e["street"] == "preflop" and e["action"] in ("raise", "all_in")
-               and (e["bot_id"] == me) == by_us)
+def preflop_aggressions(entries):
+    """Actual increases to the preflop bet. An all-in can also be a call."""
+    current_bet, raises = 0, []
+    for e in entries:
+        if e["street"] != "preflop":
+            break
+        if e["action"] in ("small_blind", "big_blind"):
+            current_bet = max(current_bet, e["amount"])
+        elif e["action"] in ("raise", "all_in") and e["amount"] > current_bet:
+            raises.append(e)
+            current_bet = e["amount"]
+    return raises
 
 
 def update_stats(state):
@@ -433,35 +482,48 @@ def update_stats(state):
             continue                             # start of the hand fell out of the 200-entry log
         moves = [e for e in entries if e["action"] in ("fold", "check", "call", "raise", "all_in")]
         preflop_moves = [e for e in moves if e["street"] == "preflop"]
-        for i, e in enumerate(preflop_moves):
-            if e["bot_id"] == me and e["action"] in ("raise", "all_in"):
-                reply = next((x for x in preflop_moves[i + 1:] if x["bot_id"] != me), None)
-                if reply:
-                    STATS["our_preflop_raises"] += 1
-                    STATS["folds_to_them"] += reply["action"] == "fold"
-                break
-        for i, e in enumerate(preflop_moves):
-            if e["bot_id"] == me and e["action"] in ("raise", "all_in"):
-                reply = next((x for x in preflop_moves[i + 1:] if x["bot_id"] != me), None)
-                if reply:
-                    STATS["faced_our_raises"] += 1
-                    STATS["reraises"] += reply["action"] in ("raise", "all_in")
-        STATS["hands"] += 1
-        STATS["preflop_raised"] += any(e["bot_id"] != me and e["action"] in ("raise", "all_in")
-                                       for e in preflop_moves)
+        raises = preflop_aggressions(entries)
+        aggressive_moves = {id(e) for e in raises}
+        first_raise = raises[0] if raises else None
         depth = hand_depth(h)
-        if depth is not None and depth <= SHORT_STACK_BB and preflop_moves:
+        short = depth is not None and depth <= SHORT_STACK_BB
+        STATS["hands"] += 1
+        if preflop_moves:
             first = preflop_moves[0]
-            if first["bot_id"] != me:            # they're the small blind, first in
-                STATS["short_sb_hands"] += 1
-                STATS["short_pushes"] += first["action"] in ("raise", "all_in")
+            if first["bot_id"] != me:
+                STATS["sb_opportunities"] += 1
+                STATS["sb_open_raises"] += first is first_raise and first["action"] == "raise"
+                STATS["short_sb_hands"] += short
+                if first is first_raise and first["action"] == "all_in":
+                    STATS["short_open_shoves" if short else "deep_open_shoves"] += 1
+            elif first["action"] == "call" and len(preflop_moves) > 1:
+                STATS["bb_limp_opportunities"] += 1
+                STATS["bb_iso_raises"] += preflop_moves[1] is first_raise
+        if not short:
             for i, e in enumerate(preflop_moves):
-                if e["bot_id"] == me and e["action"] == "all_in":
-                    reply = next((x for x in preflop_moves[i + 1:] if x["bot_id"] != me), None)
-                    if reply:
-                        STATS["our_shoves"] += 1
-                        STATS["shoves_called"] += reply["action"] != "fold"
-                    break
+                if e["bot_id"] != me and not (i and preflop_moves[i - 1]["action"] == "all_in"):
+                    STATS["deep_jam_chances"] += 1
+                    STATS["deep_jams"] += e["action"] == "all_in"
+        first_our_raise = True
+        for i, e in enumerate(preflop_moves):
+            if e["bot_id"] != me or id(e) not in aggressive_moves or i + 1 == len(preflop_moves):
+                continue
+            reply = preflop_moves[i + 1]            # heads-up: their answer to our raise
+            if first_our_raise:
+                STATS["our_preflop_raises"] += 1
+                STATS["folds_to_them"] += reply["action"] == "fold"
+                first_our_raise = False
+            if e["action"] == "raise":
+                STATS["faced_our_raises"] += 1
+                if id(reply) in aggressive_moves:
+                    STATS["reraises"] += 1
+                    STATS["reraise_shoves"] += reply["action"] == "all_in"
+            elif short and e is first_raise:
+                STATS["our_shoves"] += 1
+                STATS["shoves_called"] += reply["action"] != "fold"
+            elif short:
+                STATS["our_reshoves"] += 1
+                STATS["reshoves_called"] += reply["action"] != "fold"
 
         # Postflop, replaying the pot so we know how big each bet they faced was.
         pot, street, bet_open, put_in, later = 0, None, False, {}, 0
@@ -469,14 +531,14 @@ def update_stats(state):
             action, amount, who = e["action"], e.get("amount") or 0, e["bot_id"]
             if e["street"] != street:
                 street, bet_open, put_in = e["street"], False, {}
-            aggressive = action in ("raise", "all_in")
+            aggressive = action in ("raise", "all_in") and amount > max(put_in.values(), default=0)
             if who != me and street != "preflop" and action in ("fold", "check", "call", "raise", "all_in"):
                 if bet_open:
                     to_call = max(put_in.values()) - put_in.get(who, 0)
                     bucket = size_bucket(to_call / max(1, pot - to_call))
                     STATS["faced_bets"] += 1
                     STATS["raises"] += aggressive
-                    STATS["calls"] += action == "call"
+                    STATS["calls"] += action in ("call", "all_in") and not aggressive
                     STATS["faced_by_size"][later][bucket] += 1
                     STATS["continued_by_size"][later][bucket] += action != "fold"
                     later = later or int(action != "fold")
@@ -488,11 +550,24 @@ def update_stats(state):
             elif action in ("small_blind", "big_blind", "call"):
                 pot += amount
                 put_in[who] = put_in.get(who, 0) + amount
-            elif aggressive:
+            elif action in ("raise", "all_in"):
                 pot += amount - put_in.get(who, 0)
                 put_in[who] = amount
             if street != "preflop":
                 bet_open = bet_open or aggressive
+
+        # Was their last postflop bet a bluff? Only knowable when they showed.
+        shown = next((e.get("cards") for e in entries if e["action"] == "show" and e["bot_id"] != me), None)
+        last = None
+        for e in entries:
+            if e["bot_id"] != me and e["action"] in ("raise", "all_in") and e["street"] in STREETS_LEFT:
+                last = e["street"]
+        board = _board_by_hand.get(h) or []
+        need = {"flop": 3, "turn": 4, "river": 5}.get(last)
+        if shown and need and len(board) >= need:
+            STATS["sd_bets"] += 1
+            cards = [eval7.Card(c) for c in shown]
+            STATS["sd_bluffs"] += strength(cards, [eval7.Card(c) for c in board[:need]]) < DRAW_SCORE
 
 
 def hand_depth(h):
@@ -512,6 +587,45 @@ def shrunk(count, chances, prior, weight=10):
     return (count + prior * weight) / (chances + weight)
 
 
+def preflop_width(state, raises):
+    """Estimate the opponent's range from the roles of their preflop raises."""
+    width = 1.0
+    me = state["your_bot_id"]
+    eff = effective_bb(state)
+    ante = state["blinds"].get("ante", 0) / state["blinds"]["bb"]
+    reraise_freq = shrunk(STATS["reraises"], STATS["faced_our_raises"], 0.18, RANGE_PRIOR_WEIGHT)
+    for i, e in enumerate(raises):
+        if e["bot_id"] == me:
+            continue
+        jam = e["action"] == "all_in" or (
+            i == len(raises) - 1 and state["street"] == "preflop"
+            and state["amount_owed"] >= state["your_stack"]
+        )
+        if i > 0:
+            shove_share = shrunk(STATS["reraise_shoves"], STATS["reraises"],
+                                 0.55 if eff <= SHORT_STACK_BB else 0.35, RANGE_PRIOR_WEIGHT)
+            width *= reraise_freq * (shove_share if jam else 1.0)
+        elif e["seat"] != state["button_seat"]:
+            width = shrunk(STATS["bb_iso_raises"], STATS["bb_limp_opportunities"],
+                           0.25, RANGE_PRIOR_WEIGHT)
+        elif not jam:
+            width = shrunk(STATS["sb_open_raises"], STATS["sb_opportunities"],
+                           0.45, RANGE_PRIOR_WEIGHT)
+        elif eff <= SHORT_STACK_BB:
+            width = shrunk(STATS["short_open_shoves"], STATS["short_sb_hands"],
+                           nash_share(eff + ante, 2 if ante else 0), SHOVE_PRIOR_WEIGHT)
+        else:
+            width = shrunk(STATS["deep_open_shoves"], STATS["sb_opportunities"] - STATS["short_sb_hands"],
+                           0.20, SHOVE_PRIOR_WEIGHT)
+        if jam and eff > SHORT_STACK_BB:
+            # Deep jams are rare, so each one says a lot: pool them across spots.
+            width = max(width, shrunk(STATS["deep_jams"], STATS["deep_jam_chances"],
+                                      DEEP_JAM_PRIOR, DEEP_JAM_PRIOR_WEIGHT))
+    if raises and raises[-1]["bot_id"] == me:
+        width *= 0.75                              # they called our last raise
+    return max(width, 0.03)
+
+
 def opponent_range(state):
     """(width, keep) for range_equity, from what the opponent did this hand.
 
@@ -523,18 +637,7 @@ def opponent_range(state):
     moves = [e for e in state["action_log"]
              if e["action"] in ("fold", "check", "call", "raise", "all_in")]
 
-    preflop_moves = [e for e in moves if e["street"] == "preflop"]
-    their_raises = sum(e["bot_id"] != me and e["action"] in ("raise", "all_in")
-                       for e in preflop_moves)
-    width = 1.0
-    if their_raises:
-        reraise_freq = shrunk(STATS["reraises"], STATS["faced_our_raises"], 0.35, RANGE_PRIOR_WEIGHT)
-        width = shrunk(STATS["preflop_raised"], STATS["hands"], 0.45, RANGE_PRIOR_WEIGHT) \
-            * reraise_freq ** (their_raises - 1)
-    raises = [e for e in preflop_moves if e["action"] in ("raise", "all_in")]
-    if raises and raises[-1]["bot_id"] == me:
-        width *= 0.75                            # they called our raise
-    width = max(width, 0.03)
+    width = preflop_width(state, preflop_aggressions(state["action_log"]))
 
     bet_freq = shrunk(STATS["bets"], STATS["bet_chances"], 0.45, RANGE_PRIOR_WEIGHT)
     raise_freq = shrunk(STATS["raises"], STATS["faced_bets"], 0.25, RANGE_PRIOR_WEIGHT)
@@ -555,7 +658,40 @@ def opponent_range(state):
         bet_open = bet_open or aggressive
     seen = STATS["bet_chances"] + STATS["faced_bets"]
     keep = max(keep, KEEP_FLOOR * max(0.0, 1 - seen / KEEP_TRUST_OBS))
-    return width, keep
+    return width, keep, bluff_share(state)
+
+
+def last_bet_fraction(entries, who):
+    """Size (fraction of the pot before it) of `who`'s last postflop bet or raise in `entries`, or None."""
+    pot, street, put_in, fraction = 0, None, {}, None
+    for e in entries:
+        action, amount, actor = e["action"], e.get("amount") or 0, e["bot_id"]
+        if e["street"] != street:
+            street, put_in = e["street"], {}
+        top = max(put_in.values(), default=0)
+        if action in ("raise", "all_in") and amount > top:
+            if actor == who and street not in ("preflop", "showdown"):
+                behind = pot + top - put_in.get(actor, 0)        # the pot once they've called
+                fraction = (amount - top) / max(1, behind)
+            pot += amount - put_in.get(actor, 0)
+            put_in[actor] = amount
+        elif action in ("ante",):
+            pot += amount
+        elif action in ("small_blind", "big_blind", "call"):
+            pot += amount
+            put_in[actor] = put_in.get(actor, 0) + amount
+    return fraction
+
+
+def bluff_share(state):
+    """The bluff share of their range: the equilibrium ratio for their last bet's
+    size, scaled by how often their showdown bets have been bluffs."""
+    opp = opponent(state)["bot_id"]
+    fraction = last_bet_fraction(state["action_log"], opp)
+    if fraction is None:
+        return 0.0
+    rate = shrunk(STATS["sd_bluffs"], STATS["sd_bets"], BLUFF_PRIOR_RATE, BLUFF_PRIOR_WEIGHT)
+    return min(BLUFF_MAX, fraction / (1 + 2 * fraction) * rate / BLUFF_PRIOR_RATE)
 
 
 def size_bucket(fraction):
@@ -631,7 +767,7 @@ def bet_ev(state, sample, extra):
     raised = 0.0 if all_in else cont * raise_share()
     called = cont - raised
 
-    eq_called = sample.equity(cont)                  # against the hands that would continue
+    eq_called = sample.equity(cont, skip=raised)     # the strongest slice takes the raise branch
     take = called * (eq_called * (behind + 2 * extra) - owed - extra)
     ev = (1 - cont) * pot + take
     if raised:
@@ -778,19 +914,32 @@ def equity_vs_top(cls, share):
     return (EQ_MATRIX[i] * w).sum() / max(w.sum(), 1e-9)
 
 
-def all_in_odds(state):
-    """Equity needed to get all-in now: what we still put in over the final pot
-    (counting only the chips both of us can match)."""
+def preflop_equity(state, cls, width):
+    if EQ_MATRIX is not None:
+        return equity_vs_top(cls, width)
+    return range_equity(state["your_cards"], [], width, 1.0, sims=PREFLOP_RANGE_SIMS)
+
+
+def reshove_ev(state, cls, width, call_rate):
+    """EV in chips of jamming over a raise, measured from the current decision."""
     opp = opponent(state)
     ours = state["your_stack"] + state["your_bet_this_street"]
     theirs = opp["stack"] + opp["bet_this_street"]
     matched = min(ours, theirs)
     dead = state["pot"] - state["your_bet_this_street"] - opp["bet_this_street"]
-    return (matched - state["your_bet_this_street"]) / (2 * matched + dead)
+    cost = matched - state["your_bet_this_street"]
+    call_width = width * call_rate
+    if EQ_MATRIX is not None:
+        weights = COMBO_WEIGHT[CLASS_INDEX[cls]]
+        call_rate = (weights @ range_mask(call_width)) / (weights @ range_mask(width))
+        eq = equity_vs_top(cls, call_width)
+    else:
+        eq = preflop_equity(state, cls, max(0.03, call_width))
+    return (1 - call_rate) * state["pot"] + call_rate * (eq * (2 * matched + dead) - cost)
 
 
-def short_stack(state, cls, eff, on_button, they_raised):
-    """Push or fold at SHORT_STACK_BB or less (strategy.md section 4)."""
+def short_stack(state, cls, eff, on_button, raises):
+    """Open-shove or fold. Against a live raise, compare call, shove and fold."""
     bb = state["blinds"]["bb"]
     ante = state["blinds"].get("ante", 0) / bb
     eff += ante                                  # the chart counts the stack before the ante
@@ -798,7 +947,7 @@ def short_stack(state, cls, eff, on_button, they_raised):
     nash = NASH_PUSH_FOLD[cls]
     shove, no = {"action": "all_in"}, check_or_fold(state)
 
-    if not they_raised:
+    if not raises:
         if not on_button or EQ_MATRIX is None:   # (big blind after a limp: shove the pushing range)
             return shove if nash[col] >= eff else no
         # Best response to how often this opponent calls our shoves.
@@ -806,23 +955,34 @@ def short_stack(state, cls, eff, on_button, they_raised):
                             nash_share(eff, col + 1), SHOVE_PRIOR_WEIGHT)
         return shove if push_ev(cls, eff, call_share, ante) > -(0.5 + ante) else no
 
-    if EQ_MATRIX is None:
-        return shove if nash[col + 1] >= eff else no
-    # They shoved (or raised): call with enough equity against how widely they push.
-    push_share = shrunk(STATS["short_pushes"], STATS["short_sb_hands"],
-                        nash_share(eff, col), SHOVE_PRIOR_WEIGHT)
-    return shove if equity_vs_top(cls, push_share) >= all_in_odds(state) else no
+    width = preflop_width(state, raises)
+    equity = preflop_equity(state, cls, width)
+    realization = SHORT_CALL_REALIZATION_IP if on_button else SHORT_CALL_REALIZATION_OOP
+    owed = state["amount_owed"]
+    call_ev = equity * realization * (state["pot"] + owed) - owed
+    call_prior = min(1.0, nash_share(eff, col + 1) / width)
+    call_rate = shrunk(STATS["reshoves_called"], STATS["our_reshoves"], call_prior, SHOVE_PRIOR_WEIGHT)
+    jam_ev = reshove_ev(state, cls, width, call_rate)
+    if jam_ev > max(0, call_ev):
+        return shove
+    return {"action": "call"} if call_ev > 0 else no
 
 
 def preflop(state, cls, top):
     bb = state["blinds"]["bb"]
     eff = effective_bb(state)
     on_button = state["seat_to_act"] == state["button_seat"]
-    they_raised = preflop_raises(state, by_us=False) > 0
-    we_raised = preflop_raises(state, by_us=True) > 0
+    raises = preflop_aggressions(state["action_log"])
+    me = state["your_bot_id"]
+    they_raised = any(e["bot_id"] != me for e in raises)
+    we_raised = any(e["bot_id"] == me for e in raises)
 
+    if state["amount_owed"] and (opponent(state)["is_all_in"] or state["amount_owed"] >= state["your_stack"]):
+        width = preflop_width(state, raises)
+        eq = preflop_equity(state, cls, width)
+        return {"action": "call" if eq >= pot_odds(state) else "fold"}
     if eff <= SHORT_STACK_BB:
-        return short_stack(state, cls, eff, on_button, they_raised)
+        return short_stack(state, cls, eff, on_button, raises)
 
     # Button, first in: raise to 2.5bb or fold.
     if on_button and not they_raised:
@@ -839,11 +999,8 @@ def preflop(state, cls, top):
     # Facing a raise: compare our hand with the hands this opponent raises with
     # (wide for a maniac, narrow for a nit). Re-raise when well ahead of that
     # range, call when the pot odds allow, otherwise fall back on the chart.
-    width, _ = opponent_range(state)
-    if EQ_MATRIX is not None:
-        eq = equity_vs_top(cls, width)
-    else:
-        eq = range_equity(state["your_cards"], [], width, 1.0, sims=PREFLOP_RANGE_SIMS)
+    width = preflop_width(state, raises)
+    eq = preflop_equity(state, cls, width)
     reraise = RERAISE_MULT * state["current_bet"]
     if eq >= RERAISE_EQUITY and (top <= PREMIUM_TOP
                                  or not over_cap(state, reraise - state["your_bet_this_street"])):
@@ -932,6 +1089,8 @@ def decide(game_state: dict) -> dict:
 
     try:
         _depth_by_hand.setdefault(game_state["hand_num"], effective_bb(game_state))
+        if len(game_state["community_cards"]) > len(_board_by_hand.get(game_state["hand_num"], [])):
+            _board_by_hand[game_state["hand_num"]] = list(game_state["community_cards"])
         update_stats(game_state)
         hole = game_state["your_cards"]
         board = game_state["community_cards"]
@@ -941,10 +1100,10 @@ def decide(game_state: dict) -> dict:
         if game_state["street"] == "preflop":
             move = preflop(game_state, cls, TOP_PCT[cls])
         else:
-            width, keep = opponent_range(game_state)
-            sample = RangeSample(hole, board, width, keep, sims=POSTFLOP_SIMS)
-            debug.update(equity=round(sample.equity(), 3),
-                         range_width=round(width, 3), range_keep=round(keep, 3))
+            width, keep, bluff = opponent_range(game_state)
+            sample = RangeSample(hole, board, width, keep, sims=POSTFLOP_SIMS, bluff=bluff)
+            debug.update(equity=round(sample.equity(), 3), range_width=round(width, 3),
+                         range_keep=round(keep, 3), bluff=round(bluff, 3))
             if not game_state["can_check"]:
                 debug["needed"] = round(pot_odds(game_state), 3)
             move, info = postflop(game_state, sample)

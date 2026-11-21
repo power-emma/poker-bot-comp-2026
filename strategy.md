@@ -12,7 +12,8 @@ and choose the bet size that takes the most.
   - *Deep (hands 1–60, roughly 200bb down to 65bb).* Real postflop poker. This
     is where value betting pays most, because stacks are big enough to
     take several streets of bets.
-  - *Short (about 15bb or less).* Push or fold preflop, from a chart.
+  - *Short (about 15bb or less).* Open-shove or fold. Facing a smaller raise,
+    compare calling, shoving, and folding.
 - **Duplicate pairs.** The same cards are played twice with the seats swapped,
   and only winning both matches wins the pairing. Card luck mostly cancels
   out, so skill and exploiting the opponent decide results.
@@ -84,9 +85,9 @@ Model `P(call | b)` as a function of the bet as a fraction of the pot,
 - Treat the opponent's range as their starting hands ranked by strength,
   narrowed each street by what they did (they called preflop, so they're in
   the top X%).
-- If they call size `b` with probability `c`, assume they call with the
-  **strongest `c` share** of their current range. Simulate our equity against
-  just those hands with eval7, using weighted sampling of their hole cards.
+- If they continue against size `b` with probability `c`, take the
+  **strongest `c` share** of their current range. Simulate our equity with
+  eval7 and use separate slices for callers and raisers.
 - Showdowns calibrate this. Each `show` entry in `match_action_log` tells us
   what they actually called with at a given size. If they call large bets
   with weak hands, their calling range is wider than "the strongest `c`
@@ -95,9 +96,8 @@ Model `P(call | b)` as a function of the bet as a fraction of the pot,
 ### 3.4 When they raise back
 
 Add a third outcome: `P(raise | b)` times our EV against their raising range
-(usually we fold, and lose `b`, unless our hand is very strong). Against
-maniacs who raise often, this pulls our sizes down or toward checking and
-calling.
+(usually we fold, and lose `b`, unless our hand is very strong). The strongest
+part of the continuing range raises. The rest of that range calls.
 
 ### 3.5 Planning bets over several streets
 
@@ -156,13 +156,17 @@ itself:
   from the Nash calling share toward what we've seen (prior worth 8 shoves).
   With no data this reproduces the Nash push range. Against an any-two caller
   it pushes every hand with more than about 48% equity against a random hand.
-- **Calling a shove (or a raise at short stacks).** Our equity against their
-  shoving range must beat the exact pot odds of getting all-in, counting only
-  the chips both of us can match. Their shoving range is the top Y% of hands,
-  with Y shrunk from the Nash push share toward how often they push. So it
-  calls wide against a maniac and tight against a nit.
+- **Calling a shove.** Compare equity against the estimated shoving range
+  with the pot odds, counting only the chips both stacks can match. The model
+  tracks button opens, re-raises, and shoves separately. Short-stack button
+  shoves start at the Nash push share.
+- **Facing a raise with chips behind.** Compare folding, calling, and
+  shoving. Discount checkdown equity to 90% in position or 80% out of position
+  for a flat call. For a shove, estimate how much of their raising range calls,
+  then use equity against that tighter range and the pot won when they fold.
 - **Big blind after a limp:** shove the Nash pushing range.
-- **Without the data file:** the Nash chart alone.
+- **Without the data file:** use the Nash chart for opening shoves and
+  simulate preflop equity for calls and re-shoves.
 
 The matrix also replaced the 1,000-deal simulation for deep-stack preflop
 decisions against a raise (exact and instant).
