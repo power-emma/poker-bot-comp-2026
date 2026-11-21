@@ -1,14 +1,14 @@
 """
-Tight-aggressive bot (see strategy.md). No value-bet sizing yet: bets use
-fixed fractions of the pot.
+Tight-aggressive bot with value betting by expected take (see strategy.md).
 
   - Preflop: every starting hand has a "top %" from a table of equity against a
     random hand. Deep stacks play TAG ranges; at 15 big blinds or less it's
     push or fold.
   - Postflop: Monte Carlo equity against the opponent's estimated range (the
     hands that would have bet, raised and called the way they did this hand,
-    given how often this opponent does each). Bet strong hands, c-bet the flop
-    after raising preflop, call by pot odds, fold the rest.
+    given how often this opponent does each). Every option (check, call, fold,
+    and each bet size) is scored by EV: how likely this opponent is to fold,
+    call or raise at that size, and our equity against the hands that call.
   - Seven-two suited is played as a slightly better hand than its rank, and
     its flush draws like high flush draws (strategy.md 7.1). Seven-two offsuit
     folds unless the opponent folds too much to preflop raises.
@@ -59,6 +59,7 @@ for _cls in PREFLOP_EQUITY:
 
 SHORT_STACK_BB = 15
 PREFLOP_RANGE_SIMS = 1000
+POSTFLOP_SIMS = 3000             # more than preflop: narrow calling ranges use a slice of them
 RERAISE_EQUITY = 0.60            # re-raise preflop with this much equity against their raising range
 OUT_OF_POSITION_MARGIN = 0.08    # extra equity a preflop call needs, for the streets still to play
 
@@ -68,8 +69,23 @@ STATS = {
     "hands": 0, "preflop_raised": 0,               # hands seen, hands they raised preflop
     "bet_chances": 0, "bets": 0,                   # postflop, nothing to call: did they bet?
     "faced_bets": 0, "calls": 0, "raises": 0,      # postflop, facing a bet: call / raise?
+    "faced_by_size": [0, 0, 0, 0],                 # ... the same, split by the bet's size
+    "continued_by_size": [0, 0, 0, 0],             #     (see SIZE_BUCKETS): didn't fold
 }
 _seen_hands = set()
+
+# Bet sizes as a fraction of the pot before the bet: up to 0.6, up to 1.1,
+# up to 2.5, overbets (usually all-ins). Each bucket's typical size is used
+# for its prior.
+SIZE_BUCKETS = (0.6, 1.1, 2.5)
+BUCKET_TYPICAL = (0.5, 0.85, 1.6, 5.0)
+
+# Value betting (strategy.md section 3).
+BET_FRACTIONS = (0.33, 0.5, 0.75, 1.0, 1.5)     # candidate sizes, as a fraction of the pot
+STACK_OFF_EQUITY = 0.55          # if they raise our bet, call with this much equity against their raises
+RAISE_MULTIPLE = 3               # ...assuming they raise to about this many times our bet
+SIZE_PRIOR_WEIGHT = 6            # a size bucket's prior counts as this many observed bets
+STREETS_LEFT = {"flop": 3, "turn": 2, "river": 1}
 
 # Opponent hands that haven't made a pair but have a draw rank like a middling
 # pair when we estimate their range.
@@ -129,12 +145,34 @@ def strength(opp, board):
     return value
 
 
-def range_equity(hole, board, width, keep, sims=SIMULATIONS):
-    """Equity against the opponent's estimated range (ties count half).
+class RangeSample:
+    """Simulated showdowns against the opponent's estimated range.
 
     The range is every hand in the top `width` of starting hands, then the
-    strongest `keep` share of those on this board.
+    strongest `keep` share of those on this board, ordered strongest first.
+    Each simulation records which hand in that order the opponent held, so
+    `equity(share)` gives our equity against just the strongest `share` of the
+    range (the hands that would call a big bet) from the same simulations.
     """
+
+    def __init__(self, hole, board, width, keep, sims=SIMULATIONS):
+        self.results = range_showdowns(hole, board, width, keep, sims)
+        self.size = max(i for i, _ in self.results) + 1 if self.results else 1
+
+    def equity(self, share=1.0):
+        """Equity (ties count half) against the strongest `share` of the range."""
+        cutoff = max(MIN_RANGE_COMBOS, round(self.size * share))
+        outcomes = [r for i, r in self.results if i < cutoff]
+        return sum(outcomes) / len(outcomes) if outcomes else 0.5
+
+
+def range_equity(hole, board, width, keep, sims=SIMULATIONS):
+    """Equity against the opponent's estimated range (ties count half)."""
+    return RangeSample(hole, board, width, keep, sims).equity()
+
+
+def range_showdowns(hole, board, width, keep, sims):
+    """[(index of the opponent's hand in the range, our result 1 / 0.5 / 0)] per simulation."""
     hero = [eval7.Card(c) for c in hole]
     known = [eval7.Card(c) for c in board]
     used = set(hole) | set(board)
@@ -145,24 +183,23 @@ def range_equity(hole, board, width, keep, sims=SIMULATIONS):
     for i in range(len(deck)):
         for j in range(i + 1, len(deck)):
             opp = [deck[i], deck[j]]
-            if TOP_PCT[hand_class([str(deck[i]), str(deck[j])])] <= width:
-                candidates.append((strength(opp, known) if known else 0, opp))
+            cls = hand_class([str(deck[i]), str(deck[j])])
+            if TOP_PCT[cls] <= width:
+                candidates.append((strength(opp, known) if known else PREFLOP_EQUITY[cls], opp))
     candidates.sort(key=lambda x: -x[0])
     n = min(len(candidates), max(MIN_RANGE_COMBOS, round(len(candidates) * keep)))
     opp_range = [opp for _, opp in candidates[:n]]
 
-    score = 0.0
+    results = []
     for _ in range(sims):
-        opp = random.choice(opp_range)
+        index = random.randrange(n)
+        opp = opp_range[index]
         drawn = random.sample(deck, to_come + 2)
         full_board = known + [c for c in drawn if c not in opp][:to_come]
         ours = eval7.evaluate(hero + full_board)
         theirs = eval7.evaluate(opp + full_board)
-        if ours > theirs:
-            score += 1.0
-        elif ours == theirs:
-            score += 0.5
-    return score / sims
+        results.append((index, 1.0 if ours > theirs else 0.5 if ours == theirs else 0.0))
+    return results
 
 
 def hand_label(hole, board):
@@ -217,13 +254,6 @@ def preflop_raises(state, by_us):
                and (e["bot_id"] == me) == by_us)
 
 
-def we_raised_last_preflop(state):
-    me = state["your_bot_id"]
-    raises = [e for e in state["action_log"]
-              if e["street"] == "preflop" and e["action"] in ("raise", "all_in")]
-    return bool(raises) and raises[-1]["bot_id"] == me
-
-
 def update_stats(state):
     """Count, over finished hands, how the opponent plays: folds to our first
     preflop raise, how often they raise preflop, and postflop how often they
@@ -251,22 +281,35 @@ def update_stats(state):
         STATS["preflop_raised"] += any(e["bot_id"] != me and e["action"] in ("raise", "all_in")
                                        for e in preflop_moves)
 
-        street, bet_open = None, False
-        for e in moves:
-            if e["street"] == "preflop":
-                continue
+        # Postflop, replaying the pot so we know how big each bet they faced was.
+        pot, street, bet_open, put_in = 0, None, False, {}
+        for e in entries:
+            action, amount, who = e["action"], e.get("amount") or 0, e["bot_id"]
             if e["street"] != street:
-                street, bet_open = e["street"], False
-            aggressive = e["action"] in ("raise", "all_in")
-            if e["bot_id"] != me:
+                street, bet_open, put_in = e["street"], False, {}
+            aggressive = action in ("raise", "all_in")
+            if who != me and street != "preflop" and action in ("fold", "check", "call", "raise", "all_in"):
                 if bet_open:
+                    to_call = max(put_in.values()) - put_in.get(who, 0)
+                    bucket = size_bucket(to_call / max(1, pot - to_call))
                     STATS["faced_bets"] += 1
                     STATS["raises"] += aggressive
-                    STATS["calls"] += e["action"] == "call"
+                    STATS["calls"] += action == "call"
+                    STATS["faced_by_size"][bucket] += 1
+                    STATS["continued_by_size"][bucket] += action != "fold"
                 else:
                     STATS["bet_chances"] += 1
                     STATS["bets"] += aggressive
-            bet_open = bet_open or aggressive
+            if action == "ante":
+                pot += amount
+            elif action in ("small_blind", "big_blind", "call"):
+                pot += amount
+                put_in[who] = put_in.get(who, 0) + amount
+            elif aggressive:
+                pot += amount - put_in.get(who, 0)
+                put_in[who] = amount
+            if street != "preflop":
+                bet_open = bet_open or aggressive
 
 
 def opponent_folds_to_raise():
@@ -319,6 +362,93 @@ def opponent_range(state):
                 keep *= continue_freq
         bet_open = bet_open or aggressive
     return width, keep
+
+
+def size_bucket(fraction):
+    """0, 1 or 2: a bet of `fraction` of the pot is small, medium or large."""
+    return sum(fraction > edge for edge in SIZE_BUCKETS)
+
+
+def prior_continue(fraction):
+    """Before we know them: the share of hands an opponent continues with
+    against a bet of `fraction` of the pot. Close to the rational defence rate
+    1 / (1 + fraction), tilted slightly toward calling, since hackathon bots
+    fold too little more often than too much. The tilt is kept small because
+    we assume callers hold the strongest hands: a big floor would make huge
+    overbets look profitable against opponents we know nothing about."""
+    return 0.05 + 0.95 / (1 + fraction)
+
+
+def continue_probability(fraction):
+    """How likely this opponent is to call or raise a bet of `fraction` of the pot.
+
+    Starts from the prior, scaled by how much they continue overall, then
+    learns from how they answered bets of this size.
+    """
+    overall = shrunk(STATS["raises"] + STATS["calls"], STATS["faced_bets"], 0.60) / 0.60
+    bucket = size_bucket(fraction)
+    typical = BUCKET_TYPICAL[bucket]
+    bucket_prior = min(0.98, max(0.02, prior_continue(typical) * overall))
+    learned = shrunk(STATS["continued_by_size"][bucket], STATS["faced_by_size"][bucket],
+                     bucket_prior, SIZE_PRIOR_WEIGHT)
+    # Smooth within the bucket: a slightly bigger bet is called slightly less.
+    return min(0.98, max(0.02, learned * prior_continue(fraction) / prior_continue(typical)))
+
+
+def raise_share():
+    """Of the times they don't fold to a bet, how often they raise it."""
+    return shrunk(STATS["raises"], STATS["raises"] + STATS["calls"], 0.30)
+
+
+def bet_ev(state, sample, extra):
+    """(EV, expected take, call chance) of calling and raising by `extra` more.
+
+    EV counts the chips we get back minus the chips we put in from now on, so
+    folding is 0. Expected take is the part won when they call: the chips we
+    expect to extract with a value bet.
+    """
+    pot = state["pot"]
+    owed = min(state["amount_owed"], state["your_stack"])
+    behind = pot + owed                              # the pot once we've matched their bet
+    all_in = extra >= max_raise(state)
+
+    cont = continue_probability(extra / behind)
+    raised = 0.0 if all_in else cont * raise_share()
+    called = cont - raised
+
+    eq_called = sample.equity(cont)                  # against the hands that would continue
+    take = called * (eq_called * (behind + 2 * extra) - owed - extra)
+    ev = (1 - cont) * pot + take
+    if raised:
+        eq_raised = sample.equity(raised)
+        if eq_raised >= STACK_OFF_EQUITY:            # they raise to about 3x our bet, we call
+            total = min(max_raise(state), RAISE_MULTIPLE * extra)
+            ev += raised * (eq_raised * (behind + 2 * total) - owed - total)
+        else:                                        # they raise, we fold
+            ev -= raised * (owed + extra)
+    return ev, take, cont
+
+
+def max_raise(state):
+    """The most we can usefully raise by, beyond calling: the smaller remaining stack."""
+    owed = min(state["amount_owed"], state["your_stack"])
+    return max(0, min(state["your_stack"] - owed, opponent(state)["stack"]))
+
+
+def bet_sizes(state):
+    """Candidate raises (chips beyond calling): pot fractions, the geometric
+    size that gets the stacks in by the river, and all-in."""
+    room = max_raise(state)
+    if room <= 0:
+        return []
+    behind = state["pot"] + min(state["amount_owed"], state["your_stack"])
+    streets = STREETS_LEFT[state["street"]]
+    geometric = ((1 + 2 * room / behind) ** (1 / streets) - 1) / 2
+    smallest = state["min_raise_to"] - state["current_bet"]
+    sizes = {room}
+    for fraction in BET_FRACTIONS + (geometric,):
+        sizes.add(min(room, max(smallest, int(fraction * behind))))
+    return sorted(s for s in sizes if s > 0)
 
 
 def raise_to(state, amount):
@@ -400,26 +530,44 @@ def preflop(state, cls, top):
 
 # ── Postflop ──────────────────────────────────────────────────────────────────
 
-def postflop(state, eq):
+def postflop(state, sample):
+    """Pick the option with the highest EV (strategy.md section 3).
+
+    Without betting: check (our equity share of the pot), or call / fold.
+    Betting: every candidate size, scored by how likely this opponent is to
+    fold, call or raise at that size and our equity against the hands that
+    would call. Returns (move, debug info).
+    """
     hole, board = state["your_cards"], state["community_cards"]
     pot = state["pot"]
-    draw_72s = flush_draw_72s(hole, board)
+    eq = sample.equity()
 
     if state["can_check"]:
-        if eq >= 0.65 or draw_72s:                   # strong hand, or 7-2 suited semi-bluff
-            return raise_to(state, state["current_bet"] + 2 / 3 * pot)
-        if state["street"] == "flop" and we_raised_last_preflop(state) and eq >= 0.45:
-            return raise_to(state, state["current_bet"] + 1 / 2 * pot)   # c-bet
-        return {"action": "check"}
+        options = [({"action": "check"}, eq * pot, 0.0, None)]
+    else:
+        call = min(state["amount_owed"], state["your_stack"])
+        live_pot = pot - (state["amount_owed"] - call)
+        options = [({"action": "fold"}, 0.0, 0.0, None),
+                   ({"action": "call"}, eq * (live_pot + call) - call, 0.0, None)]
+    bets = []
+    for extra in bet_sizes(state):
+        ev, take, cont = bet_ev(state, sample, extra)
+        bets.append((raise_to(state, state["current_bet"] + extra), ev, take, cont))
 
-    if eq >= 0.75:
-        return raise_to(state, 3 * state["current_bet"])
-    if draw_72s and state["street"] == "flop":
-        # Play it like a high flush draw: raise, and happily get all-in on the flop.
-        if state["your_bet_this_street"] > 0:
-            return {"action": "call"}
-        return raise_to(state, 3 * state["current_bet"])
-    return {"action": "call"} if eq >= pot_odds(state) else {"action": "fold"}
+    best = max(options + bets, key=lambda o: o[1])
+
+    # 7-2 suited with a flush draw: play it like a high flush draw (strategy.md 7.1).
+    if flush_draw_72s(hole, board) and best[0]["action"] in ("check", "call", "fold") and bets:
+        if state["street"] == "flop" and state["your_bet_this_street"] > 0:
+            best = next(o for o in options if o[0]["action"] == "call")   # get it in on the flop
+        else:
+            best = max(bets, key=lambda o: o[1])                           # semi-bluff
+
+    move, ev, take, cont = best
+    info = {"ev": round(ev), "check_or_call_ev": round(max(o[1] for o in options))}
+    if cont is not None:
+        info.update(expected_take=round(take), call_chance=round(cont, 2))
+    return move, info
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -440,11 +588,13 @@ def decide(game_state: dict) -> dict:
             move = preflop(game_state, cls, TOP_PCT[cls])
         else:
             width, keep = opponent_range(game_state)
-            eq = range_equity(hole, board, width, keep)
-            debug.update(equity=round(eq, 3), range_width=round(width, 3), range_keep=round(keep, 3))
+            sample = RangeSample(hole, board, width, keep, sims=POSTFLOP_SIMS)
+            debug.update(equity=round(sample.equity(), 3),
+                         range_width=round(width, 3), range_keep=round(keep, 3))
             if not game_state["can_check"]:
                 debug["needed"] = round(pot_odds(game_state), 3)
-            move = postflop(game_state, eq)
+            move, info = postflop(game_state, sample)
+            debug.update(info)
 
         if is_seven_two(hole):
             debug["seven_two"] = cls

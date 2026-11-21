@@ -274,11 +274,41 @@ baseline, and 8 of 12 against `my_bots/maniac`. The maniac losses were
 coolers that lost to bad luck (AK against J4 all-in preflop, for example), but
 12 matches is too few to be sure.
 
+**Done: value betting by expected take (section 3), in `my_bots/tag`.**
+Every postflop option is scored by EV and the best one is played:
+
+- **Options:** check, call or fold, and bets of 33%, 50%, 75%, 100% and 150%
+  of the pot, the geometric size and all-in.
+- **Call chance:** learned per size bucket (up to 0.6 pot, up to 1.1, up to
+  2.5, overbets), starting from the prior `0.05 + 0.95 / (1 + f)` scaled by
+  how often they continue overall.
+- **Equity when called:** against the strongest share of their range that
+  continues. One simulation pass gives every share at once.
+- **Raises:** assumed to go to about 3x our bet. We call with 55% equity
+  against their raising range, and fold otherwise.
+- **Logging:** `ev`, `expected_take` and `call_chance` go into the debug
+  output.
+
+Checks on hand-made states:
+
+- **Against a station:** goes all-in with the nuts and with top pair, and
+  value bets second pair on the river.
+- **Against a nit:** bets small with top pair and bluffs the river with
+  nothing.
+- **Against an unknown opponent:** checks second pair on the river.
+
+The prior's loose-caller floor was cut from 15% to 5%. At 15% the bot went
+all-in with top pair against opponents it knew nothing about, because the
+model treats every caller as holding the strongest hands.
+
+`my_bots/tag_v1` is the same bot with the old fixed-size postflop play, kept
+for comparison.
+
 **Next, split across the two computers.**
 
 Computer 1 (`my_bots/tag/bot.py`):
 
-1. Value bet sizing by expected take (section 3).
+1. Check predicted take against real results (3.7), and tune the priors.
 2. More opponent statistics (section 5), including showdown cards.
 3. Side-prize adjustments.
 
