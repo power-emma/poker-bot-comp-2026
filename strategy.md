@@ -202,6 +202,34 @@ with their preflop raise rate, which we see every hand (a maniac starts near
 -3,372 to -2,657bb over 50 matches, but wins stayed at 31 of 50. The baseline
 is unaffected (it never bets).
 
+## 4.2 Calling margins removed (v8)
+
+Testing got about 80x faster (`tools/spar.sh`: Sherman's harness in one
+container on all cores) and we tuned against his 22 sparring bots. The
+calling margins (8% extra equity for preflop calls, 6% early in the match for
+big calls) made the bot fold too much: the range estimate already accounts
+for how strong the opponent is, and our own bets stay capped early. Removing
+both was the best variant in both runs it was in.
+
+Full suite, 20 duplicate pairs against each of 22 bots, fresh seeds:
+
+| Variant | Score | Pairs won | Lost |
+|---|---|---|---|
+| v6 (margins 0.08 / 0.06) | 0.741 | 249 | 37 |
+| Preflop margin 0.04 | 0.731 | 240 | 37 |
+| **No margins (v8)** | **0.762** | **259** | **28** |
+| Preflop margin -0.03 | 0.739 | 241 | 31 |
+
+Score = (pairs won + half the drawn ones) / pairs. The gain is real but
+modest (about one standard error). Small screens (10 pairs against 4 bots)
+showed +0.16 and overstated it. Curves that start with a margin and fade it
+(over hands or over observed decisions, `CALL_TRUST_OBS`, `OOP_EARLY_EXTRA`)
+all scored between v6 and no margins. They're still in the code, switched off.
+Push/fold up to 20bb (`SHORT_STACK_BB=20`) helped in one run and hurt in
+another: noise, not adopted.
+
+Weakest matchups now: `jam_fold` 0.55, `fuzz_random` 0.55, `floater` 0.62.
+
 ## 5. Opponent modelling
 
 Keep statistics in module-level variables. Each match is one process, and

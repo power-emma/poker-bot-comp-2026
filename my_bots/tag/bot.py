@@ -150,7 +150,7 @@ SHOVE_PRIOR_WEIGHT = 8           # the Nash range counts as this many observed s
 PREFLOP_RANGE_SIMS = 1000
 POSTFLOP_SIMS = 3000             # more than preflop: narrow calling ranges use a slice of them
 RERAISE_EQUITY = 0.60            # re-raise preflop with this much equity against their raising range
-OUT_OF_POSITION_MARGIN = 0.08    # extra equity a preflop call needs, for the streets still to play
+OUT_OF_POSITION_MARGIN = 0.0     # extra equity a preflop call needs (tuned: 0.08 folded too much, v8)
 BUTTON_OPEN_TOP = 0.50           # open (raise first in) from the button with the top X% of hands
 BB_ISO_TOP = 0.20                # big blind raises the limping button with the top X%
 OPEN_SIZE_BB = 2.5               # button open size, in big blinds
@@ -213,7 +213,15 @@ EARLY_CAP = 0.3
 TRUST_HANDS = 30
 NUT_EQUITY = 0.85
 PREMIUM_TOP = 0.03               # preflop near-nuts: AA-QQ, AKs
-EARLY_CALL_MARGIN = 0.06
+EARLY_CALL_MARGIN = 0.0         # tuned: 0.06 folded too much (v8); call_margin() keeps the curve
+# How the early call margin fades. 0: over TRUST_HANDS hands. N > 0: over the
+# first N of their postflop decisions we've seen (most early hands end
+# preflop, so hands seen can overstate how much we know about their betting).
+CALL_TRUST_OBS = 0
+# Preflop: extra calling margin on top of OUT_OF_POSITION_MARGIN at the start
+# of the match, fading to 0 over OOP_TRUST_HANDS hands.
+OOP_EARLY_EXTRA = 0.0
+OOP_TRUST_HANDS = 30
 
 
 # ── Hand helpers ──────────────────────────────────────────────────────────────
@@ -680,6 +688,16 @@ def trust():
     return min(1.0, STATS["hands"] / TRUST_HANDS)
 
 
+def call_margin():
+    """Extra equity a call past the early cap needs: EARLY_CALL_MARGIN at the
+    start, fading to 0 as data on this opponent comes in."""
+    if CALL_TRUST_OBS:
+        known = min(1.0, (STATS["bet_chances"] + STATS["faced_bets"]) / CALL_TRUST_OBS)
+    else:
+        known = trust()
+    return EARLY_CALL_MARGIN * (1 - known)
+
+
 def over_cap(state, more):
     """Would putting `more` chips in now commit more of the effective stack
     than the early-match cap allows?"""
@@ -830,9 +848,9 @@ def preflop(state, cls, top):
     if eq >= RERAISE_EQUITY and (top <= PREMIUM_TOP
                                  or not over_cap(state, reraise - state["your_bet_this_street"])):
         return raise_to(state, reraise)
-    margin = OUT_OF_POSITION_MARGIN
+    margin = OUT_OF_POSITION_MARGIN + OOP_EARLY_EXTRA * max(0.0, 1 - STATS["hands"] / OOP_TRUST_HANDS)
     if top > PREMIUM_TOP and over_cap(state, state["amount_owed"]):
-        margin += EARLY_CALL_MARGIN * (1 - trust())
+        margin += call_margin()
     if eq >= pot_odds(state) + margin:
         return {"action": "call"}
     if we_raised:
@@ -874,7 +892,7 @@ def postflop(state, sample):
         live_pot = pot - (state["amount_owed"] - call)
         options = [({"action": "fold"}, 0.0, 0.0, None)]
         if not (over_cap(state, call) and eq < NUT_EQUITY
-                and eq < pot_odds(state) + EARLY_CALL_MARGIN * (1 - trust())):
+                and eq < pot_odds(state) + call_margin()):
             options.append(({"action": "call"}, eq * (live_pot + call) - call, 0.0, None))
     owed = min(state["amount_owed"], state["your_stack"])
     bets = []
