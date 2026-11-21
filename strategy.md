@@ -134,6 +134,71 @@ in `data/`. Value betting still applies: against opponents who call all-ins
 too often, push only hands that beat their calling range. Against opponents
 who fold too much, push wider.
 
+**How it's built (v4).** `tools/pushfold_nash.py` computes the equilibrium
+itself:
+
+- **Equity matrix.** The all-in equity of each of the 169 hand classes
+  against each other class (40,000 deals per pair, in eval7's C simulator),
+  plus how many combos of the second class don't share a card with the first.
+  It's saved as `my_bots/tag/data/preflop_equity.json` (260 KB) and loaded at
+  import.
+- **Nash chart.** Fictitious play (3,000 iterations) at every depth from 1 to
+  30bb in half-bb steps, without antes and with this tournament's 10% antes.
+  Each hand gets "push up to" and "call up to" depths, stored as
+  `NASH_PUSH_FOLD` in `bot.py`. The ranges match published heads-up charts:
+  at 10bb the button pushes 58% and the big blind calls 37%. At 20bb it's 40%
+  and 22%.
+
+**In play:**
+
+- **Pushing (button, first in).** A best response to how often this opponent
+  calls our shoves. Their calling range is the top X% of hands, with X shrunk
+  from the Nash calling share toward what we've seen (prior worth 8 shoves).
+  With no data this reproduces the Nash push range. Against an any-two caller
+  it pushes every hand with more than about 48% equity against a random hand.
+- **Calling a shove (or a raise at short stacks).** Our equity against their
+  shoving range must beat the exact pot odds of getting all-in, counting only
+  the chips both of us can match. Their shoving range is the top Y% of hands,
+  with Y shrunk from the Nash push share toward how often they push. So it
+  calls wide against a maniac and tight against a nit.
+- **Big blind after a limp:** shove the Nash pushing range.
+- **Without the data file:** the Nash chart alone.
+
+The matrix also replaced the 1,000-deal simulation for deep-stack preflop
+decisions against a raise (exact and instant).
+
+## 4.1 Small pots early (v4)
+
+A skill edge wins a freezeout more often over many small pots than one big
+one, and early in the match the model knows least. So:
+
+- **Commitment cap.** Bets and raises we start may commit at most 30% of the
+  effective stack at first, rising to all of it by hand 30
+  (`EARLY_CAP`, `TRUST_HANDS`). Near-nut hands are exempt: 85% equity
+  postflop, or AA-QQ and AKs preflop.
+- **Calls past the cap** need 6 extra points of equity at first, fading to 0
+  by hand 30 (`EARLY_CALL_MARGIN`). Pot size isn't only ours to choose, and
+  folding everything to a maniac's raises would be a leak.
+- **Range floor.** Until we've seen 20 of their postflop decisions, their bets
+  and calls can't narrow their range below 30% of what's left (scaled down as
+  data comes in). Range-narrowing priors now count as 4 observations, not 10,
+  and their re-raise rate is learned rather than fixed at 0.35.
+
+Results, 50 matches each, same seeds as the previous version:
+
+| Opponent | Before | v4 |
+|---|---|---|
+| Maniac | 28 | 31 |
+| Baseline | 46 (2.86bb per hand) | 47 (2.28bb per hand, longer matches) |
+
+Push/fold against v3 head to head: 24-26 in matches, 3-4 in duplicate
+pairings (18 split), so it's even against a similar bot.
+
+**Still leaking against the maniac:** calling the flop and turn, then folding
+the river with a pair. Most early hands end preflop, so there's little
+postflop data by hand 10. Next idea: seed the postflop bet-frequency priors
+from their preflop raise rate, which we see every hand.
+
 ## 5. Opponent modelling
 
 Keep statistics in module-level variables. Each match is one process, and
@@ -356,6 +421,5 @@ Computer 2 (separate files only, so there are no merge conflicts in `bot.py`):
    lucky one.
 2. Sparring bots in `my_bots/`: nit, always-all-in, "check means call",
    min-raiser, random, fixed-size bettor.
-3. A real heads-up Nash push/fold chart as a Python dict (hand class to
-   push-up-to and call-up-to stack depth in big blinds), to replace
-   `push_pct` and `call_shove_pct`.
+3. ~~A real heads-up Nash push/fold chart~~ Done in v4 on computer 1
+   (section 4).

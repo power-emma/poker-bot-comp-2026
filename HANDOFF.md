@@ -33,6 +33,8 @@ Context for picking up this work in a new session. Read this, then
 | `strategy.md` | The full strategy and design, with results and roadmap (section 10). Keep it updated. |
 | `my_bots/tag/bot.py` | **The main bot.** Tight-aggressive preflop, range-aware equity, value betting by EV, 7-2 rules. |
 | `my_bots/tag_v1/bot.py` | The same bot with fixed bet sizes instead of value betting. Used for comparison. |
+| `my_bots/tag/data/preflop_equity.json` | 169x169 all-in equity matrix, used for push/fold and preflop range equity. Ships with the bot. |
+| `tools/pushfold_nash.py` | Builds the matrix and the Nash push/fold chart (run it in the sandbox image). |
 | `my_bots/baseline/bot.py` | First bot: equity against a random hand plus pot odds, call or fold only. Sparring partner. |
 | `my_bots/maniac/bot.py` | Sparring partner: raises the pot every time. |
 | `bots/caller`, `bots/template` | Kit bots: a calling station and a simple template. |
@@ -51,8 +53,13 @@ are named `v1`, `v2`, ... for now.
   - Facing a raise, the bot computes equity against this opponent's raising
     range and re-raises at 60% or more. It calls when the pot odds plus an
     8% margin allow, and otherwise uses a defend chart.
-  - At 15bb or less it's push or fold, using rough formulas (`push_pct`,
-    `call_shove_pct`), which are placeholders for a real Nash chart.
+  - At 15bb or less it's push or fold (v4, strategy.md section 4). Pushes
+    are a best response to how often they call our shoves, and calls need
+    equity against their shoving range above the pot odds. Both ranges start
+    at the Nash equilibrium (`NASH_PUSH_FOLD`, from `tools/pushfold_nash.py`)
+    and use the all-in equity matrix in `my_bots/tag/data/preflop_equity.json`.
+    The `data/` folder must ship with the bot (it falls back to the chart alone
+    without it).
 - **Opponent model:**
   - `update_stats` parses `match_action_log` for finished hands. Each hand is
     processed once (`_seen_hands`); the log only keeps 200 entries.
@@ -151,7 +158,7 @@ read live from disk, so **don't edit a bot while a batch is running**.
    `expected_take` against actual chips won over many matches and tune
    `prior_continue`, `SIZE_PRIOR_WEIGHT`, `RAISE_MULTIPLE` and
    `STACK_OFF_EQUITY`.
-5. **A real heads-up Nash push/fold chart** as a dict, replacing `push_pct` and
+5. ~~**A real heads-up Nash push/fold chart**~~ Done in v4. Was: a dict, replacing `push_pct` and
    `call_shove_pct`. That matters because late in the match everything is
    push or fold.
 6. **More sparring bots:** a nit, an always-all-in bot, a "check when owing" bot
